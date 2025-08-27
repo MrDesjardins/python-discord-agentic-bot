@@ -1,0 +1,15 @@
+{
+  "python.analysis.extraPaths": ["./deps"],
+  "python.testing.unittestArgs": ["-v", "-s", "./tests", "-p", "*test.py"],
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": ["tests"],
+  "editor.defaultFormatter": "ms-python.black-formatter",
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+  "black-formatter.args": [
+    "--verbose"
+  ],
+  "makefile.configureOnOpen": false
+}
