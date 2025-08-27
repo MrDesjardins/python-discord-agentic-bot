@@ -9,6 +9,10 @@ The agentic bot works with a custom dynamic workflow using the LangGraph framewo
 Here are few commands to set up the environment and dependencies.
 
 ```sh
+# Add Python to a specific version
+pyenv install 3.12.10
+pyenv local 3.12.10
+
 # Create Environment
 python3 -m venv .venv
 
