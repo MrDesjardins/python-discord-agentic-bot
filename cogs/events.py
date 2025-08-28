@@ -8,10 +8,17 @@ import asyncio
 from dotenv import load_dotenv
 from discord.ext import commands
 import discord
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.runtime import Runtime
+from deps.agents.agent_workflow import (
+    AIConversationCustomContext,
+    AIConversationWorkflow,
+)
 from deps.bot_singleton import BotSingleton
 from deps.log import print_log, print_error_log
 from deps.mybot import MyBot
-
+from deps.siege.rank import get_user_rank_siege
+from deps.rules.system_instructions import system_instruction_prompt
 
 load_dotenv()
 
@@ -104,11 +111,35 @@ class MyEventsCog(commands.Cog):
                 # Remove duplicates and sort by creation time
                 messages = list({m.id: m for m in messages}.values())
                 messages.sort(key=lambda m: m.created_at)
-                context = "\n".join(
+                previous_messages = "\n".join(
                     f"{m.author.display_name} said: {m.content}" for m in messages
                 )
                 try:
-                    response = "Test"
+
+                    # Create runtime context with personalization info
+                    ctx = AIConversationCustomContext(
+                        provider="openai",
+                        user_discord_id=message.author.id,
+                        user_rank=get_user_rank_siege(message.author),
+                        user_discord_display_name=message.author.display_name,
+                    )
+
+                    # Pass it to the runtime
+                    runtime = Runtime(context=ctx)
+
+                    workflow = AIConversationWorkflow()
+
+                    # Now when you start the workflow, it has access to ctx.user_name
+                    response = await workflow.graph.ainvoke(
+                        {
+                            "messages": [
+                                HumanMessage(content=message.content),
+                                SystemMessage(content=system_instruction_prompt),
+                            ]
+                        },
+                        runtime=runtime,
+                    )
+
                     if response is not None:
                         await message_ref.edit(
                             content="✅ " + message.author.mention + " " + response
