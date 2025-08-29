@@ -1,14 +1,14 @@
 from typing import Any, Dict, Literal, Optional, TypedDict, Annotated
+from typing_extensions import TypedDict
 from dataclasses import dataclass
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
 from langgraph.runtime import Runtime
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.errors import GraphRecursionError
-from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from deps.database.utils_database import get_table_schema
@@ -53,98 +53,88 @@ def get_activity_schema() -> str:
     return f"""{get_table_schema('user_activity')}"""
 
 
+def database_tool(query: str, db_name: DBName) -> Any:
+    with DatabaseManager.get_database_manager() as db:
+        try:
+            cursor = db.get_cursor(db_name)
+            cursor.execute(query)
+            results = cursor.fetchall()
+            return results
+        except Exception as e:
+            return f"SQL_ERROR: {str(e)}"
+
+
 @tool
-def stats_database(query: str) -> str:
+def stats_database(query: str) -> Any:
     """Query the Stats database. Input should be a SQL query. Use `get_stats_schema` tool if unsure about table names and fields."""
-    with DatabaseManager.get_database_manager() as db:
-        try:
-            cursor = db.get_cursor(DBName.SIEGE)
-            cursor.execute(query)
-            results = cursor.fetchall()
-            return str(results)
-        except Exception as e:
-            # Return error back to LLM to retry
-            return f"SQL_ERROR: {str(e)}"
+    return database_tool(query, DBName.SIEGE)
 
 
 @tool
-def tournament_database(query: str) -> str:
+def tournament_database(query: str) -> Any:
     """Query the Tournament database. Input should be a SQL query. Use `get_tournament_schema` tool if unsure about table names and fields."""
-    with DatabaseManager.get_database_manager() as db:
-        try:
-            cursor = db.get_cursor(DBName.SIEGE)
-            cursor.execute(query)
-            results = cursor.fetchall()
-            return str(results)
-        except Exception as e:
-            # Return error back to LLM to retry
-            return f"SQL_ERROR: {str(e)}"
+    return database_tool(query, DBName.SIEGE)
 
 
 @tool
-def activity_database(query: str) -> str:
+def activity_database(query: str) -> Any:
     """Query the Activity database. Input should be a SQL query. Use `get_activity_schema` tool if unsure about table names and fields."""
-    with DatabaseManager.get_database_manager() as db:
-        try:
-            cursor = db.get_cursor(DBName.SIEGE)
-            cursor.execute(query)
-            results = cursor.fetchall()
-            return str(results)
-        except Exception as e:
-            # Return error back to LLM to retry
-            return f"SQL_ERROR: {str(e)}"
+    return database_tool(query, DBName.SIEGE)
 
 
-async def execute_with_retry(agent, user_msg: str, tool_hint: Optional[str]):
-    """Retry SQL generation up to N times if tool execution fails."""
-    context_msgs = [
-        HumanMessage(
-            content=f"{user_msg}."
-            + (f" Use {tool_hint} for data." if tool_hint else "")
+def get_bot_role() -> SystemMessage:
+    """Define the bot's role in the conversation."""
+    return SystemMessage(
+        content=(
+            "You are a bot that is mentioned in a Discord server. You need to answer to the user who mentioned you."
+            "You should not mention anything about your name or your purpose, just answer the question."
+            "Keep responses concise."
         )
-    ]
-
-    for attempt in range(MAX_RETRIES):
-        result = await agent.ainvoke({"messages": context_msgs})
-        last_output = result.content if hasattr(result, "content") else str(result)
-
-        if "SQL_ERROR" not in last_output:
-            return result  # ✅ Success
-        else:
-            # Add the error back into the context so LLM can self-correct
-            context_msgs.append(
-                HumanMessage(
-                    content=f"Retry: Previous query failed with error: {last_output}. Fix the SQL."
-                )
-            )
-
-    return AIMessage(
-        content=f"ERROR: Could not generate a valid SQL query after {MAX_RETRIES} attempts."
     )
 
 
-# -------------------
-# Example Post-Processing
-# -------------------
+async def execute_plain(agent, prompt_msgs: list[BaseMessage]):
+    """Run agent without SQL-specific retry logic."""
+    return await agent.ainvoke({"messages": prompt_msgs + [get_bot_role()]})
 
 
-def postprocess_stats(data: Any) -> Dict:
-    """Clean/reshape stats DB output into a structured object."""
-    # Suppose data = [(1, "Alice", 50), (2, "Bob", 70)]
-    rows = [dict(id=row[0], name=row[1], score=row[2]) for row in data]
-    return {"type": "stats", "players": rows}
+async def execute_sql_with_retry(agent, prompt_msgs: list[BaseMessage], user_id: int):
+    """Retry SQL generation up to N times if tool execution fails."""
+    context_msgs = (
+        prompt_msgs
+        + [
+            SystemMessage(
+                content=(
+                    "You must generate only SELECT SQL queries that fetch relevant data. "
+                    "Never update, insert, delete, truncate, alter, or drop. "
+                    "Queries must be valid for SQLite 3.45. "
+                    "Prefer aggregation (COUNT, SUM, AVG, MAX, MIN) to reduce result size. "
+                    "If selecting raw rows, LIMIT to 100. "
+                    "Do not mention SQL or schema in your response."
+                    f"The user who asked the question user_id: `{str(user_id)}` which is relevant to the query. "
+                )
+            )
+        ]
+        + [get_bot_role()]
+    )
 
+    for _attempt in range(MAX_RETRIES):
+        result = await agent.ainvoke({"messages": context_msgs})
+        last_output = getattr(result, "content", str(result))
 
-def postprocess_tournament(data: Any) -> Dict:
-    """Clean/reshape tournament DB output into structured object."""
-    # Suppose data = [(10, "NYC", 5000)]
-    rows = [dict(id=row[0], location=row[1], prize=row[2]) for row in data]
-    return {"type": "tournament", "tournaments": rows}
+        if "SQL_ERROR" not in last_output:
+            return result
+        context_msgs.append(
+            HumanMessage(
+                content=f"Retry: The query failed with `{last_output}`. "
+                "Here is the schema again to help fix it:\n"
+                f"{get_table_schema('user_full_stats_info')}"
+            )
+        )
 
-
-def postprocess_api(data: Any) -> Dict:
-    """Clean API result."""
-    return {"type": "api", "raw": data}
+    return AIMessage(
+        content=f"ERROR: Could not generate valid SQL after {MAX_RETRIES} attempts."
+    )
 
 
 @dataclass
@@ -154,10 +144,9 @@ class AIConversationCustomContext:
     """
 
     provider: Literal["openai", "google"] = "openai"
-
+    message_history: list[str] = []
     user_discord_id: int = 0
-    user_discord_display_name: str
-
+    user_discord_display_name: str = ""
     user_rank: str = ""
 
 
@@ -205,28 +194,33 @@ class AIConversationWorkflow:
 
         graph_builder = StateGraph(State)
         graph_builder.add_node("chatbot", self.chatbot)
-        graph_builder.add_node("postprocess", self.postprocess_step)
         graph_builder.add_node("message_gen", self.message_gen_step)
         graph_builder.add_node("personalize", self.personalize_step)
 
         # Order of execution
         graph_builder.add_edge(START, "chatbot")
-        graph_builder.add_edge("chatbot", "postprocess")
-        graph_builder.add_edge("postprocess", "message_gen")
+        graph_builder.add_edge("chatbot", "message_gen")
         graph_builder.add_edge("message_gen", "personalize")
         graph_builder.add_edge("personalize", END)
 
         self.graph = graph_builder.compile()
 
-    async def chatbot(self, state: State):
+    async def chatbot(
+        self, state: State, runtime: Runtime[AIConversationCustomContext]
+    ):
         try:
+            # Take last N messages from context history (avoid exceeding token limits)
+            history_to_include = runtime.context.message_history
+            history_text = "\n".join(history_to_include)
+
             # Keyword-based routing
-            tool_hint = None
+            tool_hint = []
             user_msg = (
                 state["messages"][-1]
                 if isinstance(state["messages"], list)
                 else state["messages"]
             )
+
             user_msg_lower = user_msg.lower()
 
             keywords_full_match_info = [
@@ -240,54 +234,47 @@ class AIConversationWorkflow:
                 "operator",
                 "map",
             ]
+
             if any(keyword in user_msg_lower for keyword in keywords_full_match_info):
-                tool_hint = "stats_database"
+                tool_hint.append("stats_database")
 
             keywords_tournament = ["tournament", "bet"]
             if any(keyword in user_msg_lower for keyword in keywords_tournament):
-                tool_hint = "tournament_database"
+                tool_hint.append("tournament_database")
 
             keywords_schedule = ["time", "date", "schedule"]
             if any(keyword in user_msg_lower for keyword in keywords_schedule):
-                tool_hint = "activity_database"
+                tool_hint.append("activity_database")
+
+            # Construct prompt
+            tool_hint_str = f"Use {','.join(tool_hint)} for data." if tool_hint else ""
+            prompt_msgs: list[BaseMessage] = [
+                HumanMessage(
+                    content=f"Channel history:\n{history_text}\n\nCurrent message:\n{user_msg}\n{tool_hint_str}"
+                )
+            ]
+
+            # Personalize
+            context = ""
+            if runtime.context.user_rank == "Champion":
+                context += "In the message, call the user 'champion'. "
+                context += "The user like sarcasm, so answer in a sarcastic tone. "
+            else:
+                context += "You are a bot that is friendly, helpful and professional. You should not be rude or sarcastic. "
+
+            prompt_msgs.append(SystemMessage(content=context))
 
             # Pass hint to the LLM so it picks the right tool
-            output = await execute_with_retry(self.agent, user_msg, tool_hint)
             if tool_hint:
-                output = await self.agent.ainvoke(
-                    {
-                        "messages": [
-                            HumanMessage(
-                                content=f"{user_msg}. Use {tool_hint} for data."
-                            )
-                        ]
-                    },
+                output = await execute_sql_with_retry(
+                    self.agent, prompt_msgs, runtime.context.user_discord_id
                 )
             else:
-                output = await self.agent.ainvoke(
-                    {"messages": [HumanMessage(content=f"{user_msg}.")]},
-                )
+                output = await execute_plain(self.agent, prompt_msgs)
             return output
 
         except GraphRecursionError:
             print_error_log("Agent stopped due to max iterations.")
-
-    async def postprocess_step(self, state: State):
-        """Each DB result gets custom formatting."""
-        last_msg = state["messages"][-1]
-        content = last_msg.content
-
-        if "stats" in content.lower():
-            structured = postprocess_stats(content)
-        elif "tournament" in content.lower():
-            structured = postprocess_tournament(content)
-        else:
-            structured = postprocess_api(content)
-
-        return {
-            "messages": state["messages"]
-            + [AIMessage(content=f"POSTPROCESSED: {structured}")]
-        }
 
     async def message_gen_step(self, state: State):
         """Generate human-friendly final message."""
@@ -301,18 +288,29 @@ class AIConversationWorkflow:
         )
         return {"messages": state["messages"] + [final_output]}
 
-    async def personalize_step(self, state: State, runtime: Runtime[CustomContext]):
+    async def personalize_step(
+        self, state: State, runtime: Runtime[AIConversationCustomContext]
+    ):
         """Add personal tone based on the user name from runtime context."""
         last_msg = state["messages"][-1]
-        user_name = runtime.context.user_name or "friend"
+        user_name = runtime.context.user_discord_display_name or "friend"
+
+        context = ""
+        if runtime.context.user_rank == "Champion":
+            context += "In the message, call the user 'champion'. "
+            context += "The user like sarcasm, so answer in a sarcastic tone. "
+        else:
+            context += "You are a bot that is friendly, helpful and professional. You should not be rude or sarcastic. "
 
         personalized = await openai_model.ainvoke(
             [
-                HumanMessage(
-                    content=f"Take this message:\n'{last_msg.content}'\n"
-                    f"And make it more personal by addressing the user named {user_name}."
+                SystemMessage(
+                    content=(
+                        f"Take this message:\n'{last_msg.content}'\n"
+                        f"And make it more personal by addressing the user named {user_name}."
+                        f"{context}"
+                    )
                 )
             ]
         )
         return {"messages": state["messages"] + [personalized]}
-

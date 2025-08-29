@@ -79,46 +79,50 @@ class MyEventsCog(commands.Cog):
         # Check if the bot was mentioned
         if self.bot.user in message.mentions:
             if BotSingleton().bot.is_running_ai_inquiry:
-                await message.channel.send(
-                    message.author.mention
-                    + " I am already working on a inquiry. Give me more time and try later."
+                await message.reply(
+                    "I am already working on a inquiry. Give me more time and try later.",
+                    mention_author=True,
                 )
             else:
-                message_ref = await message.channel.send(
-                    message.author.mention
-                    + " Hi! I am here to help you. Please wait a moment (might take a minute) while I process your request... I will edit this message with the response if I can figure it out."
+                message_ref = await message.reply(
+                    "Hi! I am here to help you. Please wait a moment (might take a minute) while I process your request... I will edit this message with the response if I can figure it out.",
+                    mention_author=True,
                 )
-                # Fetch the last 8 messages in the same channel
-                before_replied_msg = []
-                if message.reference is not None:
-                    replied_message = await message.channel.fetch_message(
-                        message.reference.message_id
-                    )
-                    # If the message is a reply, we can fetch the last x messages before the replied message
-                    before_replied_msg = [
-                        msg
-                        async for msg in message.channel.history(
-                            limit=8, before=replied_message.created_at
-                        )
-                    ]
-                current_replied_msg = [message]
-                last_messages_channel = [
-                    msg async for msg in message.channel.history(limit=8)
+
+                history = [
+                    msg
+                    async for msg in message.channel.history(
+                        limit=50
+                    )  # fetch a bit more
                 ]
-                messages: list[discord.Message] = (
-                    before_replied_msg + current_replied_msg + last_messages_channel
-                )
-                # Remove duplicates and sort by creation time
-                messages = list({m.id: m for m in messages}.values())
-                messages.sort(key=lambda m: m.created_at)
-                previous_messages = "\n".join(
-                    f"{m.author.display_name} said: {m.content}" for m in messages
-                )
+
+                # Get messages either from the user or the bot replying to them
+                conversation = []
+                for msg in history:
+                    if msg.author == message.author:  # same user who pinged the bot
+                        conversation.append(msg)
+                    elif (
+                        msg.author == self.bot.user
+                        and msg.reference
+                        and msg.reference.resolved
+                        and msg.reference.resolved.author == message.author
+                    ):
+                        conversation.append(msg)
+
+                # Keep only the last 10 relevant ones, sorted chronologically
+                conversation = list(reversed(conversation))[-10:]
+
+
+                previous_messages = [
+                    f"{m.author.display_name} said: {m.content}" for m in conversation
+                ]
+
                 try:
 
                     # Create runtime context with personalization info
                     ctx = AIConversationCustomContext(
                         provider="openai",
+                        message_history=previous_messages,
                         user_discord_id=message.author.id,
                         user_rank=get_user_rank_siege(message.author),
                         user_discord_display_name=message.author.display_name,
