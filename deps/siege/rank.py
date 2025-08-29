@@ -11,6 +11,7 @@ siege_ranks = [
     "Copper",
 ]
 
+
 def get_user_rank_siege(user: discord.Member) -> str:
     """
     Check the user's roles to determine their rank

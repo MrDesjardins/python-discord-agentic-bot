@@ -18,7 +18,7 @@ from deps.bot_singleton import BotSingleton
 from deps.log import print_log, print_error_log
 from deps.mybot import MyBot
 from deps.siege.rank import get_user_rank_siege
-from deps.rules.system_instructions import system_instruction_prompt
+from deps.rules.system_instructions import system_instruction_when_bot_mentioned
 
 load_dotenv()
 
@@ -68,7 +68,7 @@ class MyEventsCog(commands.Cog):
         print_log("✅ on_ready() completed, bot is fully initialized.")
 
     @commands.Cog.listener()
-    async def on_message(self, message) -> None:
+    async def on_message(self, message: discord.Message) -> None:
         """
         Make the bot aware if someone mentions it in a message
         """
@@ -105,40 +105,44 @@ class MyEventsCog(commands.Cog):
                         msg.author == self.bot.user
                         and msg.reference
                         and msg.reference.resolved
+                        and isinstance(msg.reference.resolved, discord.Message)
                         and msg.reference.resolved.author == message.author
-                    ):
+                    ):  # bot replying to user
                         conversation.append(msg)
 
                 # Keep only the last 10 relevant ones, sorted chronologically
                 conversation = list(reversed(conversation))[-10:]
-
-
                 previous_messages = [
-                    f"{m.author.display_name} said: {m.content}" for m in conversation
+                    f"{m.author.display_name} (user_id: {m.author.id}) said: {m.content}"
+                    for m in conversation
                 ]
 
                 try:
-
                     # Create runtime context with personalization info
                     ctx = AIConversationCustomContext(
                         provider="openai",
                         message_history=previous_messages,
                         user_discord_id=message.author.id,
-                        user_rank=get_user_rank_siege(message.author),
+                        user_rank=(
+                            get_user_rank_siege(message.author)
+                            if isinstance(message.author, discord.Member)
+                            else "Copper"
+                        ),
                         user_discord_display_name=message.author.display_name,
                     )
 
                     # Pass it to the runtime
                     runtime = Runtime(context=ctx)
-
                     workflow = AIConversationWorkflow()
 
                     # Now when you start the workflow, it has access to ctx.user_name
                     response = await workflow.graph.ainvoke(
                         {
                             "messages": [
+                                SystemMessage(
+                                    content=system_instruction_when_bot_mentioned
+                                ),
                                 HumanMessage(content=message.content),
-                                SystemMessage(content=system_instruction_prompt),
                             ]
                         },
                         runtime=runtime,
@@ -146,19 +150,16 @@ class MyEventsCog(commands.Cog):
 
                     if response is not None:
                         await message_ref.edit(
-                            content="✅ " + message.author.mention + " " + response
+                            content=f"✅ {message.author.mention} {response}"
                         )
                     else:
                         await message_ref.edit(
-                            content="⛔ "
-                            + message.author.mention
-                            + " I am sorry, I could not process your request."
+                            content=f"⛔ {message.author.mention} I am sorry, I could not process your request."
                         )
                 except Exception as e:
                     print_error_log(f"on_message: Error processing message: {e}")
                     await message_ref.edit(
-                        content=message.author.mention
-                        + " I am sorry, I encountered an error while processing your request."
+                        content=f"{message.author.mention} I am sorry, I encountered an error while processing your request."
                     )
         # Make sure other commands still work
         await self.bot.process_commands(message)

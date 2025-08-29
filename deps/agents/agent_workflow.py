@@ -1,10 +1,13 @@
-from typing import Any, Dict, Literal, Optional, TypedDict, Annotated
-from typing_extensions import TypedDict
+"""
+Agent Workflow for the Discord bot
+"""
+
+from typing import Any, Literal, TypedDict, Annotated
 from dataclasses import dataclass
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
+from langchain.chat_models import init_chat_model
 from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
 from langgraph.runtime import Runtime
@@ -54,6 +57,9 @@ def get_activity_schema() -> str:
 
 
 def database_tool(query: str, db_name: DBName) -> Any:
+    """
+    Utility function to connect to a database
+    """
     with DatabaseManager.get_database_manager() as db:
         try:
             cursor = db.get_cursor(db_name)
@@ -66,19 +72,22 @@ def database_tool(query: str, db_name: DBName) -> Any:
 
 @tool
 def stats_database(query: str) -> Any:
-    """Query the Stats database. Input should be a SQL query. Use `get_stats_schema` tool if unsure about table names and fields."""
+    """Query the Stats database. Input should be a SQL query.
+    Use `get_stats_schema` tool if unsure about table names and fields."""
     return database_tool(query, DBName.SIEGE)
 
 
 @tool
 def tournament_database(query: str) -> Any:
-    """Query the Tournament database. Input should be a SQL query. Use `get_tournament_schema` tool if unsure about table names and fields."""
+    """Query the Tournament database. Input should be a SQL query.
+    Use `get_tournament_schema` tool if unsure about table names and fields."""
     return database_tool(query, DBName.SIEGE)
 
 
 @tool
 def activity_database(query: str) -> Any:
-    """Query the Activity database. Input should be a SQL query. Use `get_activity_schema` tool if unsure about table names and fields."""
+    """Query the Activity database. Input should be a SQL query.
+    Use `get_activity_schema` tool if unsure about table names and fields."""
     return database_tool(query, DBName.SIEGE)
 
 
@@ -178,6 +187,9 @@ class State(TypedDict):
 
 
 class AIConversationWorkflow:
+    """
+    Class that describe the workflow of a user and AI communicating back and forth (conversation)
+    """
 
     def __init__(self):
         self.agent = create_react_agent(
@@ -195,13 +207,11 @@ class AIConversationWorkflow:
         graph_builder = StateGraph(State)
         graph_builder.add_node("chatbot", self.chatbot)
         graph_builder.add_node("message_gen", self.message_gen_step)
-        graph_builder.add_node("personalize", self.personalize_step)
 
         # Order of execution
         graph_builder.add_edge(START, "chatbot")
         graph_builder.add_edge("chatbot", "message_gen")
-        graph_builder.add_edge("message_gen", "personalize")
-        graph_builder.add_edge("personalize", END)
+        graph_builder.add_edge("message_gen", END)
 
         self.graph = graph_builder.compile()
 
@@ -287,30 +297,3 @@ class AIConversationWorkflow:
             ]
         )
         return {"messages": state["messages"] + [final_output]}
-
-    async def personalize_step(
-        self, state: State, runtime: Runtime[AIConversationCustomContext]
-    ):
-        """Add personal tone based on the user name from runtime context."""
-        last_msg = state["messages"][-1]
-        user_name = runtime.context.user_discord_display_name or "friend"
-
-        context = ""
-        if runtime.context.user_rank == "Champion":
-            context += "In the message, call the user 'champion'. "
-            context += "The user like sarcasm, so answer in a sarcastic tone. "
-        else:
-            context += "You are a bot that is friendly, helpful and professional. You should not be rude or sarcastic. "
-
-        personalized = await openai_model.ainvoke(
-            [
-                SystemMessage(
-                    content=(
-                        f"Take this message:\n'{last_msg.content}'\n"
-                        f"And make it more personal by addressing the user named {user_name}."
-                        f"{context}"
-                    )
-                )
-            ]
-        )
-        return {"messages": state["messages"] + [personalized]}
