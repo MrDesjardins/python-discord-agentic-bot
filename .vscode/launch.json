@@ -12,13 +12,6 @@
       "console": "integratedTerminal"
     },
     {
-      "name": "Python Debug Botadmin.py",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/botadmin.py",
-      "console": "integratedTerminal"
-    },
-    {
       "name": "Python Debugger: Current File",
       "type": "debugpy",
       "request": "launch",

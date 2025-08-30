@@ -9,6 +9,30 @@ The agentic bot works with a custom dynamic workflow using the LangGraph framewo
 Here are few commands to set up the environment and dependencies.
 
 ```sh
+# Install Packages that Python will need
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    libssl-dev \
+    zlib1g-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    libncurses5-dev \
+    libncursesw5-dev \
+    xz-utils \
+    tk-dev \
+    libxml2-dev \
+    libxmlsec1-dev \
+    libffi-dev \
+    liblzma-dev \
+    uuid-dev \
+    wget \
+    curl \
+    llvm \
+    make \
+    git
+
 # Add Python to a specific version
 pyenv install 3.12.10
 pyenv local 3.12.10

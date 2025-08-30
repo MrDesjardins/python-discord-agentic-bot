@@ -3,7 +3,7 @@ Agent Workflow for the Discord bot
 """
 
 from typing import Any, Literal, TypedDict, Annotated
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
@@ -153,7 +153,7 @@ class AIConversationCustomContext:
     """
 
     provider: Literal["openai", "google"] = "openai"
-    message_history: list[str] = []
+    message_history: list = field(default_factory=list) # Unique list per context
     user_discord_id: int = 0
     user_discord_display_name: str = ""
     user_rank: str = ""
