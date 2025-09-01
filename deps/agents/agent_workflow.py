@@ -2,7 +2,6 @@
 Agent Workflow for the Discord bot
 """
 
-from pyexpat.errors import messages
 from typing import Any, Literal, Optional, TypedDict, Annotated, Union
 from dataclasses import dataclass, field
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
@@ -22,6 +21,7 @@ from deps.database.utils_database import get_table_schema
 from deps.database.system_database import DBName, DatabaseManager
 from deps.log import print_error_log
 from deps.models.agent_llm_model import SQLQuery
+from deps.rules.system_instructions import system_instruction_when_bot_mentioned
 
 MAX_RETRIES = 5
 MAX_ITERATIONS = 3
@@ -39,6 +39,7 @@ class AIConversationCustomContext:
 
     provider: Literal["openai", "google"] = "openai"
     message_history: list = field(default_factory=list)  # Unique list per context
+    user_question: str = ""
     user_discord_id: int = 0
     user_discord_display_name: str = ""
     user_rank: str = ""
@@ -79,13 +80,10 @@ def execute_database(query: str) -> Union[str, list[Any]]:
     Utility function to connect to a database
     """
     with DatabaseManager.get_database_manager() as db:
-        try:
-            cursor = db.get_cursor(DBName.SIEGE)
-            cursor.execute(query)
-            results = cursor.fetchall()
-            return results
-        except Exception as e:
-            return f"SQL_ERROR: {str(e)}"
+        cursor = db.get_cursor(DBName.SIEGE)
+        cursor.execute(query)
+        results = cursor.fetchall()
+        return results
 
 
 @tool
@@ -96,13 +94,7 @@ def database_tool(query: str) -> Union[str, list[Any]]:
 
 def get_bot_role() -> SystemMessage:
     """Define the bot's role in the conversation."""
-    return SystemMessage(
-        content=(
-            "You are a bot that is mentioned in a Discord server. You need to answer to the user who mentioned you. "
-            "You should not mention anything about your name or your purpose, just answer the question. "
-            "Keep responses concise. "
-        )
-    )
+    return SystemMessage(content=(system_instruction_when_bot_mentioned))
 
 
 async def execute_plain(agent, prompt_msgs: list[BaseMessage]):
@@ -118,10 +110,11 @@ sql_prompt = PromptTemplate(
         "Given an input question, first create a syntactically correct SQLite 3 query to run, "
         "Use the exact user_id: {user_id} when you need to query data for the user who is asking the questions,\n"
         "Database tables and schema: {schema}\n"
-        "User question: {question}\n\n"
+        "Past conversation that might or not be related to the question: {history}\n"
+        "User question: {question}\n"
         "Return a SQL query wrapped in this JSON schema:\n"
         "{format_instructions}"
-        "You already tried with this query {last_query} and for this error {last_error}"
+        ".\n You already tried with this query {last_query} and for this error {last_error}"
     ),
     input_variables=["question", "user_id", "last_query", "last_error"],
     partial_variables={"format_instructions": sql_parser.get_format_instructions()},
@@ -131,6 +124,7 @@ sql_prompt = PromptTemplate(
 async def execute_sql_with_structured(
     model: BaseChatModel,
     question: str,
+    history: str,
     schema: str,
     user_id: int,
 ) -> dict[str, list[BaseMessage]]:
@@ -145,6 +139,7 @@ async def execute_sql_with_structured(
         # --- Step 1: Generate SQL ---
         sql_input = sql_prompt.format_prompt(
             question=question,
+            history=history,
             schema=schema,
             user_id=user_id,
             last_query=sql_query.query if sql_query else "",
@@ -158,8 +153,12 @@ async def execute_sql_with_structured(
             # --- Step 2: Run the query ---
             if sql_query:
                 rows = execute_database(sql_query.query)
-                # Success → break
-                break
+                if len(rows) == 0:
+                    raise ValueError(
+                        "SQL query returned no results. Try a different query."
+                    )
+                else:
+                    break
 
         except Exception as e:
             last_error = str(e)
@@ -261,15 +260,8 @@ class AIConversationWorkflow:
             ctx: AIConversationCustomContext = config["configurable"]["ctx"]
 
             # Keyword-based routing
-            user_msg: HumanMessage = (
-                state["messages"][-1]
-                if isinstance(state["messages"], list)
-                else state["messages"]
-            )
-
-            user_msg_lower = (
-                user_msg.content.lower() if isinstance(user_msg.content, str) else ""
-            )
+            user_original_msg = ctx.user_question
+            user_msg_lower = user_original_msg.lower()
 
             keywords_full_match_info = [
                 "stats",
@@ -281,6 +273,8 @@ class AIConversationWorkflow:
                 "death",
                 "operator",
                 "map",
+                "clutch",
+                "rank",
             ]
             schema = get_user_schema()  # Always
 
@@ -291,15 +285,25 @@ class AIConversationWorkflow:
             if any(keyword in user_msg_lower for keyword in keywords_tournament):
                 schema += get_tournament_schema()
 
-            keywords_schedule = ["time", "date", "schedule"]
+            keywords_schedule = [
+                "time",
+                "date",
+                "schedule",
+                "activity",
+            ]
             if any(keyword in user_msg_lower for keyword in keywords_schedule):
                 schema += get_activity_schema()
+
+            user_original_msg = ctx.user_question
+            history_to_include = ctx.message_history
+            history_text = "\n".join(history_to_include)
 
             model = get_model(ctx.provider)
             query_result = await execute_sql_with_structured(
                 model=model,
                 schema=schema,
-                question=str(user_msg.content),
+                question=str(user_original_msg),
+                history=history_text,
                 user_id=ctx.user_discord_id,
             )
             if isinstance(query_result, str) and query_result.startswith("SQL_ERROR:"):
@@ -309,7 +313,7 @@ class AIConversationWorkflow:
                         AIMessage(
                             content="I ran into a database issue while handling your request. Please try again later."
                         )
-                    ]
+                    ]Z
                 }
             return query_result
 
@@ -317,6 +321,9 @@ class AIConversationWorkflow:
             print_error_log(f"Agent stopped due to max iterations: {e}")
 
     async def message_gen_step(self, state: State, config: RunnableConfig):
+        """
+        Craft the answer with the channel history, the user question and potentially information from the database
+        """
         ctx: AIConversationCustomContext = config["configurable"]["ctx"]
         last_msg = state["messages"][-1]
         if isinstance(last_msg, AIMessage):
@@ -324,17 +331,15 @@ class AIConversationWorkflow:
         else:
             structured_msg = str(last_msg)
 
-        user_original_msg: HumanMessage = (
-            state["messages"][-1]
-            if isinstance(state["messages"], list)
-            else state["messages"]
-        )
+        user_original_msg = ctx.user_question
         history_to_include = ctx.message_history
         history_text = "\n".join(history_to_include)
+
         prompt_msgs: list[BaseMessage] = [
+            SystemMessage(content=system_instruction_when_bot_mentioned),
             SystemMessage(
-                content=f"Channel history:\n{history_text}\n\nUser question to answer:\n{user_original_msg.content}\n"
-            )
+                content=f"Channel history:\n{history_text}\n\nUser question to answer:\n{user_original_msg}\n"
+            ),
         ]
 
         # Personalize
@@ -345,15 +350,14 @@ class AIConversationWorkflow:
         else:
             context += "You are a bot that is friendly, helpful and professional. You should not be rude or sarcastic. "
 
-        # if schema:
-        #     prompt_msgs.append(
-        #         SystemMessage(content=f"Here is the schema:\n{schema}")
-        #     )
-
         prompt_msgs.append(SystemMessage(content=context))
         prompt_msgs.append(
             HumanMessage(
-                content=f"Turn this into a concise, user-friendly message: {structured_msg}"
+                content=(
+                    f"Turn this into a concise message that is well formatted for Discord (use triple tick for table): {structured_msg}. \n "
+                    "Never mention anything about database, or user id, or guid or SQL or internal details. \n"
+                    "Only show the display name when you refer to the user.\n"
+                )
             )
         )
         model = get_model(ctx.provider)

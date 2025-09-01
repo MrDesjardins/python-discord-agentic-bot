@@ -127,26 +127,28 @@ class MyEventsCog(commands.Cog):
                             if isinstance(message.author, discord.Member)
                             else "Copper"
                         ),
+                        user_question=message.content,
                         user_discord_display_name=message.author.display_name,
                     )
 
                     workflow = AIConversationWorkflow(ctx)
 
                     # Now when you start the workflow, it has access to ctx.user_name
+                    state = {
+                        "messages": [
+                            SystemMessage(
+                                content=system_instruction_when_bot_mentioned
+                            ),
+                            HumanMessage(content=message.content),
+                        ]
+                    }
                     response = await workflow.graph.ainvoke(
-                        {
-                            "messages": [
-                                SystemMessage(
-                                    content=system_instruction_when_bot_mentioned
-                                ),
-                                HumanMessage(content=message.content),
-                            ]
-                        },
+                        input=state,
                         config={"configurable": {"ctx": ctx}},
                     )
 
                     if response is not None:
-                        last_text = response["messages"][-1].content
+                        last_text = response["messages"][-1].content[:3900]
                         await message_ref.edit(
                             content=f"✅ {message.author.mention} {last_text}"
                         )
