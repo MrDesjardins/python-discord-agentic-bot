@@ -131,9 +131,7 @@ class MyEventsCog(commands.Cog):
                         user_discord_display_name=message.author.display_name,
                     )
 
-                    # Pass it to the runtime
-                    runtime = Runtime(context=ctx)
-                    workflow = AIConversationWorkflow()
+                    workflow = AIConversationWorkflow(ctx)
 
                     # Now when you start the workflow, it has access to ctx.user_name
                     response = await workflow.graph.ainvoke(
@@ -145,12 +143,13 @@ class MyEventsCog(commands.Cog):
                                 HumanMessage(content=message.content),
                             ]
                         },
-                        runtime=runtime,
+                        config={"configurable": {"ctx": ctx}},
                     )
 
                     if response is not None:
+                        last_text = response["messages"][-1].content
                         await message_ref.edit(
-                            content=f"✅ {message.author.mention} {response}"
+                            content=f"✅ {message.author.mention} {last_text}"
                         )
                     else:
                         await message_ref.edit(
