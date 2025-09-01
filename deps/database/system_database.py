@@ -24,6 +24,7 @@ class DBName(str, Enum):
     SIEGE = "SIEGE"
     AI = "AI"
 
+
 def adapt_datetime(dt):
     """Convert a datetime object to a string"""
     return dt.isoformat()
@@ -45,6 +46,7 @@ class DatabaseManager:
         results = cursor.fetchall()
         print(results)
     """
+
     def __init__(self):
         sqlite3.register_adapter(datetime.datetime, adapt_datetime)
         sqlite3.register_converter("datetime", convert_datetime)
@@ -66,13 +68,13 @@ class DatabaseManager:
         """
         return cls()
 
-    def get_conn(self, name: DBName):
+    def get_conn(self, name: DBName) -> sqlite3.Connection:
         """
         Get a connection access to a specific database
         """
         return self._databases[name]["conn"]
 
-    def get_cursor(self, name: DBName):
+    def get_cursor(self, name: DBName) -> sqlite3.Cursor:
         """
         Get a cursor for a specific database
         """

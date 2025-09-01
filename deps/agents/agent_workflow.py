@@ -2,13 +2,15 @@
 Agent Workflow for the Discord bot
 """
 
-from typing import Any, Literal, TypedDict, Annotated
+from pyexpat.errors import messages
+from typing import Any, Literal, Optional, TypedDict, Annotated, Union
 from dataclasses import dataclass, field
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langchain.chat_models import init_chat_model
+from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser
 from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
@@ -72,7 +74,7 @@ def get_activity_schema() -> str:
     )
 
 
-def execute_database(query: str) -> Any:
+def execute_database(query: str) -> Union[str, list[Any]]:
     """
     Utility function to connect to a database
     """
@@ -87,7 +89,7 @@ def execute_database(query: str) -> Any:
 
 
 @tool
-def database_tool(query: str) -> Any:
+def database_tool(query: str) -> Union[str, list[Any]]:
     """Query the users database. Input should be a SQL query."""
     return execute_database(query)
 
@@ -110,44 +112,93 @@ async def execute_plain(agent, prompt_msgs: list[BaseMessage]):
 
 sql_parser = PydanticOutputParser(pydantic_object=SQLQuery)
 
-
-def sql_prompt_schema(user_id: int, schema_info: str, question: str) -> str:
-    return f"""
-You are a SQL assistant. If database data is needed, output **only** a JSON object 
-matching this Pydantic schema:
-
-{sql_parser.schema}
-
-Constraints:
-- Only SELECT queries
-- Valid SQLite 3 syntax
-- Use the provided schema: {schema_info}
-- Use the exact user_id: {user_id} if needed
-- Do not include raw SQL in your human-facing answer
-
-Question: {question}
-"""
+sql_prompt = PromptTemplate(
+    template=(
+        "You are an expert SQL assistant.\n"
+        "Given an input question, first create a syntactically correct SQLite 3 query to run, "
+        "Use the exact user_id: {user_id} when you need to query data for the user who is asking the questions,\n"
+        "Database tables and schema: {schema}\n"
+        "User question: {question}\n\n"
+        "Return a SQL query wrapped in this JSON schema:\n"
+        "{format_instructions}"
+        "You already tried with this query {last_query} and for this error {last_error}"
+    ),
+    input_variables=["question", "user_id", "last_query", "last_error"],
+    partial_variables={"format_instructions": sql_parser.get_format_instructions()},
+)
 
 
 async def execute_sql_with_structured(
-    agent,
-    ctx: AIConversationCustomContext,
+    model: BaseChatModel,
     question: str,
-    schema_info: str,
+    schema: str,
     user_id: int,
-):
-    prompt_text = sql_prompt_schema(user_id, schema_info, question)
+) -> dict[str, list[BaseMessage]]:
+    """
+    Execute SQL with retries and error feedback to the LLM.
+    """
+    last_error = None
+    sql_query: Optional[SQLQuery] = None
+    rows = None
 
-    # Ask LLM to produce structured output
-    # result = await agent.ainvoke(prompt_text)
-    model = get_model(ctx.provider)
-    result = await model.ainvoke([SystemMessage(content=prompt_text)])
+    for attempt in range(MAX_RETRIES):
+        # --- Step 1: Generate SQL ---
+        sql_input = sql_prompt.format_prompt(
+            question=question,
+            schema=schema,
+            user_id=user_id,
+            last_query=sql_query.query if sql_query else "",
+            last_error=last_error or "",
+        )
+        sql_output = await model.ainvoke(sql_input.to_string())
 
-    # Parse directly to typed object
-    sql_query: SQLQuery = sql_parser.parse(str(result.content))
+        try:
+            sql_query = sql_parser.parse(str(sql_output.content))
 
-    # Call the tool using the validated output
-    return execute_database(sql_query.query)
+            # --- Step 2: Run the query ---
+            if sql_query:
+                rows = execute_database(sql_query.query)
+                # Success → break
+                break
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt == MAX_RETRIES - 1:
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=f"Query failed after {MAX_RETRIES} retries. Error: {last_error}"
+                        )
+                    ]
+                }
+            # continue loop, LLM will try again with error feedback
+    if sql_query is None:
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"Failed to generate a valid SQL query after {MAX_RETRIES} retries."
+                )
+            ]
+        }
+    # --- Step 3: Interpret results ---
+    interpretation_prompt = PromptTemplate(
+        template=(
+            "The user asked: {question}\n\n"
+            "The SQL query executed was:\n{query}\n\n"
+            "The database returned:\n{rows}\n\n"
+            "Explain this result clearly for the user."
+        ),
+        input_variables=["question", "query", "rows"],
+    )
+
+    interp_input = interpretation_prompt.format_prompt(
+        question=question,
+        query=sql_query.query,
+        rows=rows,
+    )
+    interp_output = await model.ainvoke(interp_input.to_string())
+
+    return {"messages": [AIMessage(content=interp_output.content)]}
 
 
 def select_model(
@@ -208,8 +259,6 @@ class AIConversationWorkflow:
         try:
             # Take last N messages from context history (avoid exceeding token limits)
             ctx: AIConversationCustomContext = config["configurable"]["ctx"]
-            history_to_include = ctx.message_history
-            history_text = "\n".join(history_to_include)
 
             # Keyword-based routing
             user_msg: HumanMessage = (
@@ -246,32 +295,11 @@ class AIConversationWorkflow:
             if any(keyword in user_msg_lower for keyword in keywords_schedule):
                 schema += get_activity_schema()
 
-            # Construct prompt
-            tool_hint_str = "Use the tool database_tool to query the database using the provided schema."
-            prompt_msgs: list[BaseMessage] = [
-                SystemMessage(
-                    content=f"Channel history:\n{history_text}\n\nCurrent message:\n{user_msg.content}\n{tool_hint_str}"
-                )
-            ]
-
-            # Personalize
-            context = ""
-            if ctx.user_rank == "Champion":
-                context += "In the message, call the user 'champion'. "
-                context += "The user like sarcasm, so answer in a sarcastic tone. "
-            else:
-                context += "You are a bot that is friendly, helpful and professional. You should not be rude or sarcastic. "
-
-            if schema:
-                prompt_msgs.append(
-                    SystemMessage(content=f"Here is the schema:\n{schema}")
-                )
-            prompt_msgs.append(SystemMessage(content=context))
+            model = get_model(ctx.provider)
             query_result = await execute_sql_with_structured(
-                self.agent,
-                ctx,
+                model=model,
+                schema=schema,
                 question=str(user_msg.content),
-                schema_info=schema,
                 user_id=ctx.user_discord_id,
             )
             if isinstance(query_result, str) and query_result.startswith("SQL_ERROR:"):
@@ -295,12 +323,39 @@ class AIConversationWorkflow:
             structured_msg = last_msg.content
         else:
             structured_msg = str(last_msg)
-        model = get_model(ctx.provider)
-        final_output = await model.ainvoke(
-            [
-                HumanMessage(
-                    content=f"Turn this into a concise, user-friendly message: {structured_msg}"
-                )
-            ]
+
+        user_original_msg: HumanMessage = (
+            state["messages"][-1]
+            if isinstance(state["messages"], list)
+            else state["messages"]
         )
+        history_to_include = ctx.message_history
+        history_text = "\n".join(history_to_include)
+        prompt_msgs: list[BaseMessage] = [
+            SystemMessage(
+                content=f"Channel history:\n{history_text}\n\nUser question to answer:\n{user_original_msg.content}\n"
+            )
+        ]
+
+        # Personalize
+        context = ""
+        if ctx.user_rank == "Champion":
+            context += "In the message, call the user 'champion'. "
+            context += "The user like sarcasm, so answer in a sarcastic tone. "
+        else:
+            context += "You are a bot that is friendly, helpful and professional. You should not be rude or sarcastic. "
+
+        # if schema:
+        #     prompt_msgs.append(
+        #         SystemMessage(content=f"Here is the schema:\n{schema}")
+        #     )
+
+        prompt_msgs.append(SystemMessage(content=context))
+        prompt_msgs.append(
+            HumanMessage(
+                content=f"Turn this into a concise, user-friendly message: {structured_msg}"
+            )
+        )
+        model = get_model(ctx.provider)
+        final_output = await model.ainvoke(prompt_msgs)
         return {"messages": state["messages"] + [final_output]}
