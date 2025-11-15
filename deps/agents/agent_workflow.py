@@ -313,7 +313,7 @@ class AIConversationWorkflow:
                         AIMessage(
                             content="I ran into a database issue while handling your request. Please try again later."
                         )
-                    ]Z
+                    ]
                 }
             return query_result
 
