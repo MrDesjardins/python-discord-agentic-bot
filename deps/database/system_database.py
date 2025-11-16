@@ -87,14 +87,14 @@ class DatabaseManager:
         for key, db in self._databases.items():
             try:
                 db["cursor"].close()
-            except Exception as e:
+            except (sqlite3.Error, AttributeError) as e:
                 print_error_log(f"DatabaseManager.close({key} cursor): {e}")
             finally:
                 db["cursor"] = None
 
             try:
                 db["conn"].close()
-            except Exception as e:
+            except (sqlite3.Error, AttributeError) as e:
                 print_error_log(f"DatabaseManager.close({key} conn): {e}")
             finally:
                 db["conn"] = None

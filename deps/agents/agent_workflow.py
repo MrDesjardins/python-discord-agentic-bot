@@ -23,9 +23,11 @@ from deps.log import print_error_log
 from deps.models.agent_llm_model import SQLQuery
 from deps.rules.system_instructions import system_instruction_when_bot_mentioned
 
-MAX_RETRIES = 5
+MAX_RETRIES_SQL_VALID = 5
+MAX_RETRIES_ANSWERING_JUDGE = 5
 MAX_ITERATIONS = 3
 RECURSION_LIMIT = 2 * MAX_ITERATIONS + 1
+MAX_HISTORY_MESSAGES = 20
 
 openai_model = init_chat_model("openai:gpt-4.1")
 google_model = init_chat_model("gemini-2.5-flash", model_provider="google_genai")
@@ -75,7 +77,7 @@ def get_activity_schema() -> str:
     )
 
 
-def execute_database(query: str) -> Union[str, list[Any]]:
+def execute_database(query: str) -> list[Any]:
     """
     Utility function to connect to a database
     """
@@ -111,93 +113,43 @@ sql_prompt = PromptTemplate(
         "Use the exact user_id: {user_id} when you need to query data for the user who is asking the questions,\n"
         "Database tables and schema: {schema}\n"
         "Past conversation that might or not be related to the question: {history}\n"
+        "Pass SQL queries that you tried and failed: {sql_history}\n"
         "User question: {question}\n"
         "Return a SQL query wrapped in this JSON schema:\n"
         "{format_instructions}"
         ".\n You already tried with this query {last_query} and for this error {last_error}"
     ),
-    input_variables=["question", "user_id", "last_query", "last_error"],
+    input_variables=[
+        "question",
+        "user_id",
+        "last_query",
+        "last_error",
+        "history",
+        "schema",
+        "sql_history",
+    ],
     partial_variables={"format_instructions": sql_parser.get_format_instructions()},
 )
 
+interpretation_prompt = PromptTemplate(
+    template=(
+        "The user asked: {question}\n\n"
+        "The SQL query executed was:\n{query}\n\n"
+        "The database returned:\n{rows}\n\n"
+        "I want you to determine if the rows contains the information needed to answer the user's question. If yes, return only 'yes'. If no, return only 'no'."
+    ),
+    input_variables=["question", "query", "rows"],
+)
 
-async def execute_sql_with_structured(
-    model: BaseChatModel,
-    question: str,
-    history: str,
-    schema: str,
-    user_id: int,
-) -> dict[str, list[BaseMessage]]:
-    """
-    Execute SQL with retries and error feedback to the LLM.
-    """
-    last_error = None
-    sql_query: Optional[SQLQuery] = None
-    rows = None
-
-    for attempt in range(MAX_RETRIES):
-        # --- Step 1: Generate SQL ---
-        sql_input = sql_prompt.format_prompt(
-            question=question,
-            history=history,
-            schema=schema,
-            user_id=user_id,
-            last_query=sql_query.query if sql_query else "",
-            last_error=last_error or "",
-        )
-        sql_output = await model.ainvoke(sql_input.to_string())
-
-        try:
-            sql_query = sql_parser.parse(str(sql_output.content))
-
-            # --- Step 2: Run the query ---
-            if sql_query:
-                rows = execute_database(sql_query.query)
-                if len(rows) == 0:
-                    raise ValueError(
-                        "SQL query returned no results. Try a different query."
-                    )
-                else:
-                    break
-
-        except Exception as e:
-            last_error = str(e)
-            if attempt == MAX_RETRIES - 1:
-                return {
-                    "messages": [
-                        AIMessage(
-                            content=f"Query failed after {MAX_RETRIES} retries. Error: {last_error}"
-                        )
-                    ]
-                }
-            # continue loop, LLM will try again with error feedback
-    if sql_query is None:
-        return {
-            "messages": [
-                AIMessage(
-                    content=f"Failed to generate a valid SQL query after {MAX_RETRIES} retries."
-                )
-            ]
-        }
-    # --- Step 3: Interpret results ---
-    interpretation_prompt = PromptTemplate(
-        template=(
-            "The user asked: {question}\n\n"
-            "The SQL query executed was:\n{query}\n\n"
-            "The database returned:\n{rows}\n\n"
-            "Explain this result clearly for the user."
-        ),
-        input_variables=["question", "query", "rows"],
-    )
-
-    interp_input = interpretation_prompt.format_prompt(
-        question=question,
-        query=sql_query.query,
-        rows=rows,
-    )
-    interp_output = await model.ainvoke(interp_input.to_string())
-
-    return {"messages": [AIMessage(content=interp_output.content)]}
+judge_answer_prompt = PromptTemplate(
+    template=(
+        "You are an expert assistant that judges if the answer provided is sufficient to answer the user's question.\n"
+        "User question: {question}\n"
+        "Answer provided: {answer}\n"
+        "If the answer is sufficient, respond with 'yes'. If more information is needed, respond with 'no'."
+    ),
+    input_variables=["question", "answer"],
+)
 
 
 def select_model(
@@ -210,6 +162,7 @@ def select_model(
     """
 
     # With dynamic model selection, you must bind tools explicitly
+    del state, runtime  # Unused parameters
     return get_model(ctx.provider)
 
 
@@ -230,6 +183,15 @@ class State(TypedDict):
     """
 
     messages: Annotated[list, add_messages]
+    """
+    Keep track if the answer from the chatbot is sufficient or if more info is needed
+    """
+    is_answer_sufficient: bool
+
+    """
+    Counter to track how many times more info was requested in a workflow
+    """
+    need_more_info_counter: int
 
 
 class AIConversationWorkflow:
@@ -242,83 +204,227 @@ class AIConversationWorkflow:
             lambda state, runtime: select_model(state, runtime, ctx),
             tools=[database_tool],
         )
-
+        self.llm = get_model(ctx.provider)
         graph_builder = StateGraph(State)
         graph_builder.add_node("chatbot", self.chatbot)
+        graph_builder.add_node("needs_more_info", self.needs_more_info_step)
+        graph_builder.add_node("gather_more_info", self.gather_more_info_step)
         graph_builder.add_node("message_gen", self.message_gen_step)
+        graph_builder.add_node("judge_answer", self.judge_answer_step)
 
         # Order of execution
         graph_builder.add_edge(START, "chatbot")
-        graph_builder.add_edge("chatbot", "message_gen")
-        graph_builder.add_edge("message_gen", END)
+        graph_builder.add_edge("chatbot", "needs_more_info")
+        graph_builder.add_edge("gather_more_info", "chatbot")
+        graph_builder.add_conditional_edges(
+            "needs_more_info",
+            self.needs_more_info_condition,
+            path_map={
+                "yes": "gather_more_info",
+                "no": "message_gen",
+            },
+        )
+        graph_builder.add_edge("message_gen", "judge_answer")
+        graph_builder.add_conditional_edges(
+            "judge_answer",
+            lambda state: "yes" if state.get("is_answer_sufficient") else "no",
+            path_map={
+                "yes": END,
+                "no": "gather_more_info",
+            },
+        )
 
         self.graph = graph_builder.compile()
 
+    async def execute_sql_with_structured(
+        self,
+        question: str,
+        history: str,
+        schema: str,
+        user_id: int,
+    ) -> tuple[Optional[SQLQuery], list[Any]]:
+        """
+        Execute SQL
+        """
+        last_error = None
+        ai_sql_query: Optional[SQLQuery] = None
+        rows = None
+
+        sql_history = ""
+        last_generated_sql_query_by_ai = ""
+        for attempt in range(MAX_RETRIES_SQL_VALID):
+            # --- Step 1: Generate SQL ---
+            sql_input = sql_prompt.format_prompt(
+                question=question,
+                history=history,
+                sql_history=sql_history,
+                schema=schema,
+                user_id=user_id,
+                last_query=last_generated_sql_query_by_ai,
+                last_error=last_error or "",
+            )
+            response = await self.llm.ainvoke(
+                [HumanMessage(content=sql_input.to_string())]
+            )
+
+            try:
+                ai_sql_query = sql_parser.parse(str(response.content))
+                last_generated_sql_query_by_ai = (
+                    ai_sql_query.query if ai_sql_query else ""
+                )
+                # --- Step 2: Run the query ---
+                if ai_sql_query:
+                    rows = execute_database(ai_sql_query.query)
+                    return ai_sql_query, rows
+            except ValueError as e:
+                last_error = str(e)
+                if attempt == MAX_RETRIES_SQL_VALID - 1:
+                    return ai_sql_query, []
+            finally:
+                sql_history += f"Attempt {attempt + 1}:\nQuery: {last_generated_sql_query_by_ai}\nError: {last_error}\n"
+                # continue loop, LLM will try again with error feedback
+        return ai_sql_query, []
+
+    def needs_more_info_condition(self, state: State) -> str:
+        # Example: chatbot put its evaluation in the state
+        if state.get("is_answer_sufficient"):
+            return "no"
+        else:
+            return "yes"
+
     async def chatbot(self, state: State, config: RunnableConfig):
         try:
-            # Take last N messages from context history (avoid exceeding token limits)
             ctx: AIConversationCustomContext = config["configurable"]["ctx"]
 
-            # Keyword-based routing
             user_original_msg = ctx.user_question
             user_msg_lower = user_original_msg.lower()
 
-            keywords_full_match_info = [
-                "stats",
-                "match",
-                "data",
-                " kd ",
-                "k/d",
-                "kill",
-                "death",
-                "operator",
-                "map",
-                "clutch",
-                "rank",
-            ]
-            schema = get_user_schema()  # Always
+            # --- Keyword Routing ---
+            schema = get_user_schema()
 
-            if any(keyword in user_msg_lower for keyword in keywords_full_match_info):
+            if any(
+                k in user_msg_lower
+                for k in [
+                    "stats",
+                    "match",
+                    "data",
+                    " kd ",
+                    "k/d",
+                    "kill",
+                    "death",
+                    "operator",
+                    "map",
+                    "clutch",
+                    "rank",
+                ]
+            ):
                 schema += get_stats_schema()
 
-            keywords_tournament = ["tournament", "bet"]
-            if any(keyword in user_msg_lower for keyword in keywords_tournament):
+            if any(k in user_msg_lower for k in ["tournament", "bet"]):
                 schema += get_tournament_schema()
 
-            keywords_schedule = [
-                "time",
-                "date",
-                "schedule",
-                "activity",
-            ]
-            if any(keyword in user_msg_lower for keyword in keywords_schedule):
+            if any(
+                k in user_msg_lower
+                for k in [
+                    "time",
+                    "hour",
+                    "minute",
+                    "second",
+                    "when",
+                    "date",
+                    "schedule",
+                    "activity",
+                ]
+            ):
                 schema += get_activity_schema()
 
-            user_original_msg = ctx.user_question
-            history_to_include = ctx.message_history
-            history_text = "\n".join(history_to_include)
+            # --- Include chat history ---
+            history_text = "\n".join(ctx.message_history[:MAX_HISTORY_MESSAGES])
 
-            model = get_model(ctx.provider)
-            query_result = await execute_sql_with_structured(
-                model=model,
+            # --- Execute SQL ---
+            sql_query, rows = await self.execute_sql_with_structured(
                 schema=schema,
                 question=str(user_original_msg),
                 history=history_text,
                 user_id=ctx.user_discord_id,
             )
-            if isinstance(query_result, str) and query_result.startswith("SQL_ERROR:"):
-                return {
-                    "messages": state["messages"]
-                    + [
-                        AIMessage(
-                            content="I ran into a database issue while handling your request. Please try again later."
-                        )
-                    ]
-                }
-            return query_result
+
+            # Format content properly
+            result_payload = {
+                "type": "sql_result",
+                "sql_query": sql_query.query if sql_query else None,
+                "rows": rows,
+            }
+
+            new_message = AIMessage(content=[result_payload])
+
+            return State(
+                messages=state["messages"] + [new_message],
+                is_answer_sufficient=state.get("is_answer_sufficient", False),
+                need_more_info_counter=state.get("need_more_info_counter", 0),
+            )
 
         except GraphRecursionError as e:
             print_error_log(f"Agent stopped due to max iterations: {e}")
+            raise e
+
+    async def needs_more_info_step(self, state: State, config: RunnableConfig):
+        """
+        Determine if the answer from the chatbot is sufficient or if more info is needed
+        We should have a query that returned rows to analyze
+        If the LLM determines that more info is needed, we set is_answer_sufficient to False
+        """
+        last_msg = state["messages"][-1]
+        sql_query = last_msg.content[0]["sql_query"]
+        rows = last_msg.content[0]["rows"]
+        new_state = state.copy()
+
+        # Check if the SQL response was reasonable
+        question = config["configurable"]["ctx"].user_question
+        prompt_msgs = interpretation_prompt.format_prompt(
+            question=question, query=sql_query, rows=rows
+        )
+        final_output = await self.llm.ainvoke(
+            [HumanMessage(content=prompt_msgs.to_string())]
+        )
+
+        answer_text = str(final_output.content).strip().lower()
+
+        new_state["is_answer_sufficient"] = (
+            True if str(answer_text).lower() == "yes" else False
+        )
+
+        return new_state
+
+    def gather_more_info_step(self, state: State) -> State:
+        """
+        Ask the user for more information to clarify their request or re-perform the AI with more context
+        """
+        if state["need_more_info_counter"] >= MAX_RETRIES_ANSWERING_JUDGE:
+            return {
+                "messages": state["messages"]
+                + [
+                    AIMessage(
+                        content="The previous answer was insufficient. Let me ask for more details. Could you provide more information to help me better assist you?"
+                    )
+                ],
+                "is_answer_sufficient": False,
+                "need_more_info_counter": state["need_more_info_counter"],
+            }
+        else:
+
+            return {
+                "messages": state["messages"]
+                + [
+                    AIMessage(
+                        content="The previous answer was insufficient. Let's try again by adding the previous answer to the original question for more context."
+                    )
+                ],
+                "is_answer_sufficient": state[
+                    "is_answer_sufficient"
+                ],  # That was set to false in the needs_more_info_step step (previous step)
+                "need_more_info_counter": state["need_more_info_counter"] + 1,
+            }
 
     async def message_gen_step(self, state: State, config: RunnableConfig):
         """
@@ -326,14 +432,18 @@ class AIConversationWorkflow:
         """
         ctx: AIConversationCustomContext = config["configurable"]["ctx"]
         last_msg = state["messages"][-1]
-        if isinstance(last_msg, AIMessage):
+        if (
+            isinstance(last_msg, AIMessage)
+            or isinstance(last_msg, HumanMessage)
+            or isinstance(last_msg, SystemMessage)
+        ):
             structured_msg = last_msg.content
         else:
             structured_msg = str(last_msg)
 
         user_original_msg = ctx.user_question
         history_to_include = ctx.message_history
-        history_text = "\n".join(history_to_include)
+        history_text = "\n".join(history_to_include[:MAX_HISTORY_MESSAGES])
 
         prompt_msgs: list[BaseMessage] = [
             SystemMessage(content=system_instruction_when_bot_mentioned),
@@ -360,6 +470,30 @@ class AIConversationWorkflow:
                 )
             )
         )
-        model = get_model(ctx.provider)
-        final_output = await model.ainvoke(prompt_msgs)
+        final_output = await self.llm.ainvoke(prompt_msgs)
         return {"messages": state["messages"] + [final_output]}
+
+    async def judge_answer_step(self, state: State, config: RunnableConfig):
+        """
+        Judge if the answer generated is sufficient to answer the user's question
+        """
+        last_msg = state["messages"][-1]
+        new_state = state.copy()
+
+        # Judge
+        ctx: AIConversationCustomContext = config["configurable"]["ctx"]
+        user_original_msg = ctx.user_question
+        message_generated_previous_step = last_msg.content
+        prompt_msgs = judge_answer_prompt.format_prompt(
+            question=user_original_msg, answer=message_generated_previous_step
+        )
+        final_output = await self.llm.ainvoke(
+            [HumanMessage(content=prompt_msgs.to_string())]
+        )
+
+        answer_text = str(final_output.content).strip().lower()
+        if answer_text == "yes":
+            new_state["is_answer_sufficient"] = True
+        else:
+            new_state["is_answer_sufficient"] = False
+            new_state["need_more_info_counter"] += 1

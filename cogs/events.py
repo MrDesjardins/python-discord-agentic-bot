@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from deps.agents.agent_workflow import (
     AIConversationCustomContext,
     AIConversationWorkflow,
+    State,  # noqa: F401 - Used for type hint
 )
 from deps.bot_singleton import BotSingleton
 from deps.log import print_log, print_error_log
@@ -133,17 +134,19 @@ class MyEventsCog(commands.Cog):
 
                     workflow = AIConversationWorkflow(ctx)
 
-                    # Now when you start the workflow, it has access to ctx.user_name
-                    state = {
+                    # Create state object for ainvoke
+                    state: State = {  # type: ignore
                         "messages": [
                             SystemMessage(
                                 content=system_instruction_when_bot_mentioned
                             ),
                             HumanMessage(content=message.content),
-                        ]
+                        ],
+                        "is_answer_sufficient": False,
+                        "need_more_info_counter": 0,
                     }
                     response = await workflow.graph.ainvoke(
-                        input=state,
+                        state,
                         config={"configurable": {"ctx": ctx}},
                     )
 
@@ -156,8 +159,8 @@ class MyEventsCog(commands.Cog):
                         await message_ref.edit(
                             content=f"⛔ {message.author.mention} I am sorry, I could not process your request."
                         )
-                except Exception as e:
-                    print_error_log(f"on_message: Error processing message: {e}")
+                except (ValueError, RuntimeError, TimeoutError) as err:
+                    print_error_log(f"on_message: Error processing message: {err}")
                     await message_ref.edit(
                         content=f"{message.author.mention} I am sorry, I encountered an error while processing your request."
                     )
