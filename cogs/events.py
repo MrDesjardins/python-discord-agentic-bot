@@ -8,17 +8,14 @@ import asyncio
 from dotenv import load_dotenv
 from discord.ext import commands
 import discord
-from langchain_core.messages import HumanMessage, SystemMessage
 from deps.agents.agent_workflow import (
     AIConversationCustomContext,
     AIConversationWorkflow,
-    State,  # noqa: F401 - Used for type hint
 )
 from deps.bot_singleton import BotSingleton
 from deps.log import print_log, print_error_log
 from deps.mybot import MyBot
 from deps.siege.rank import get_user_rank_siege
-from deps.rules.system_instructions import system_instruction_when_bot_mentioned
 
 load_dotenv()
 
@@ -134,24 +131,11 @@ class MyEventsCog(commands.Cog):
 
                     workflow = AIConversationWorkflow(ctx)
 
-                    # Create state object for ainvoke
-                    state: State = {  # type: ignore
-                        "messages": [
-                            SystemMessage(
-                                content=system_instruction_when_bot_mentioned
-                            ),
-                            HumanMessage(content=message.content),
-                        ],
-                        "is_answer_sufficient": False,
-                        "need_more_info_counter": 0,
-                    }
-                    response = await workflow.graph.ainvoke(
-                        state,
-                        config={"configurable": {"ctx": ctx}},
-                    )
+                    # Run the agent workflow
+                    response = await workflow.run()
 
-                    if response is not None:
-                        last_text = response["messages"][-1].content[:3900]
+                    if response:
+                        last_text = response[:3900]
                         await message_ref.edit(
                             content=f"✅ {message.author.mention} {last_text}"
                         )
