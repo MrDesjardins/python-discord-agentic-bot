@@ -34,23 +34,11 @@ sudo apt install -y \
     git
 
 # Add Python to a specific version
-pyenv install 3.12.10
-pyenv local 3.12.10
+uv python install 
 
-# Create Environment
-python3 -m venv .venv
+# Run
+uv run bot.py
 
-# Activate Environment
-source .venv/bin/activate
-
-# Update PIP
-python3 -m pip install --upgrade pip
-
-# Install Requirements
-python3 -m pip install -r requirements.txt
-
-# Save Requirements
-python3 -m pip freeze > requirements.txt
 ```
 
 
@@ -59,8 +47,7 @@ python3 -m pip freeze > requirements.txt
 To run the bot in development:
 
 ```sh
-source .venv/bin/activate
-python3 bot.py # or ./bot.py
+uv run bot.py
 ```
 
 ## SQLite3
@@ -74,19 +61,19 @@ alias sqlite3="sqlite3 --init .sqliterc"
 # Unit Tests
 
 ```sh
-pytest -v -s ./tests/*_unit_test.py
+uv run pytest -v -s ./tests/*_unit_test.py
 ```
 
 # Integration Tests
 
 ```sh
-pytest -v -s ./tests/*_integration_test.py
+uv run pytest -v -s ./tests/*_integration_test.py
 ```
 
 # Coverage Tests on Unit Tests
 
 ```sh
-coverage run --omit="./tests/*" -m pytest -v -s ./tests/*unit_test.py && coverage html
+uv run coverage run --omit="./tests/*" -m pytest -v -s ./tests/*unit_test.py && coverage html
 ```
 
 
