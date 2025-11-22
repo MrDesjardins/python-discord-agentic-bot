@@ -1,5 +1,6 @@
 from typing import Any, List, Optional, Dict
 from dataclasses import dataclass, field
+import sqlite3
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
@@ -14,12 +15,12 @@ from deps.database.system_database import DBName, DatabaseManager
 from deps.rules.system_instructions import system_instruction_when_bot_mentioned
 
 # ---- Constants ----
-MAX_AGENT_STEPS = 20  # prevent infinite loops
-MAX_SQL_RETRIES = 8
+MAX_AGENT_STEPS = 30  # prevent infinite loops
+MAX_SQL_RETRIES = 20
 MAX_HISTORY_MESSAGES = 20
 
 # ---- Initialize chat models (adjust names/providers if needed) ----
-openai_model = init_chat_model("openai:gpt-4.1")
+openai_model = init_chat_model("openai:gpt-5-mini")
 google_model = init_chat_model("gemini-2.5-flash", model_provider="google_genai")
 
 
@@ -59,7 +60,10 @@ def get_user_schema() -> str:
 
 
 def get_stats_schema() -> str:
-    return f"{get_table_schema('user_full_match_info')}\n{get_table_schema('user_full_stats_info')}"
+    return (
+        f"{get_table_schema('user_full_match_info')}\n"
+        f"{get_table_schema('user_full_stats_info')}\n"
+    )
 
 
 def get_tournament_schema() -> str:
@@ -68,18 +72,22 @@ def get_tournament_schema() -> str:
         f"{get_table_schema('tournament_guild')}\n"
         f"{get_table_schema('tournament_game')}\n"
         f"{get_table_schema('user_tournament')}\n"
-        f"{get_table_schema('tournament_team_members')}"
+        f"{get_table_schema('tournament_team_members')}\n"
+        f"{get_table_schema('bet_user_tournament')}\n"
+        f"{get_table_schema('bet_game')}\n"
+        f"{get_table_schema('bet_ledger_entry')}\n"
+        f"{get_table_schema('bet_user_game')}\n"
     )
 
 
 def get_activity_schema() -> str:
-    return f"{get_table_schema('user_activity')}\nThe field in the table user_activity can be `connect` or `disconnect`."
+    return f"{get_table_schema('user_activity')}\nThe field `event` in the table `user_activity` can be `connect` or `disconnect`.\n"
 
 
 # Create wrapped tool functions outside the class for proper LangGraph integration
 def _create_context_tools(ctx: AIConversationCustomContext):
     """Create tool functions with context baked in."""
-    
+
     @tool("get_schema")
     async def get_schema_tool_wrapped() -> str:
         """
@@ -112,6 +120,31 @@ def _create_context_tools(ctx: AIConversationCustomContext):
         - Returns plain text; the LLM should not attempt to interpret or modify the schema.
         """
         return await get_schema_tool(user_question=ctx.user_question)
+
+    @tool("get_all_schema")
+    async def get_all_schema_tool_wrapped() -> str:
+        """
+        Select and return all the database schemas
+
+        🛠 Purpose:
+        - Ensures the LLM sees all the schema in case the situational tool did not work out.
+
+        📥 Input:
+        - None
+
+        📤 Output:
+        - A string containing the concatenated schema text for the relevant tables.
+        - Includes user, stats, tournament, and activity tables as needed.
+
+        🧠 When to use:
+        - Call this tool **before generating SQL queries** only when the get_schema did not provide sufficient information.
+        - Use this tool whenever the LLM needs structured table information
+            to generate valid queries.
+
+        🚫 Notes:
+        - Returns plain text; the LLM should not attempt to interpret or modify the schema.
+        """
+        return await get_all_schema_tool()
 
     @tool("query_sql_query_database")
     async def query_database_tool_wrapped(schema: str) -> Dict[str, Any]:
@@ -153,7 +186,9 @@ def _create_context_tools(ctx: AIConversationCustomContext):
         )
 
     @tool("format_message_for_discord")
-    async def format_discord_message_tool_wrapped(sql: Optional[str], rows: List[Any]) -> str:
+    async def format_discord_message_tool_wrapped(
+        sql: Optional[str], rows: List[Any]
+    ) -> str:
         """
         Use this tool ONLY to generate the final textual response that will be sent back to the Discord user.
 
@@ -194,7 +229,12 @@ def _create_context_tools(ctx: AIConversationCustomContext):
             provider=ctx.provider,
         )
 
-    return [get_schema_tool_wrapped, query_database_tool_wrapped, format_discord_message_tool_wrapped]
+    return [
+        get_schema_tool_wrapped,
+        get_all_schema_tool_wrapped,
+        query_database_tool_wrapped,
+        format_discord_message_tool_wrapped,
+    ]
 
 
 class ContextTools:
@@ -241,6 +281,15 @@ async def get_schema_tool(user_question: str) -> str:
     return schema
 
 
+async def get_all_schema_tool() -> str:
+    return (
+        f"{get_user_schema()}\n"
+        f"{get_stats_schema()}\n"
+        f"{get_tournament_schema()}\n"
+        f"{get_activity_schema()}\n"
+    )
+
+
 # Prompt template for SQL generation; format_instructions will be injected
 SQL_PROMPT = PromptTemplate(
     template=(
@@ -256,7 +305,13 @@ SQL_PROMPT = PromptTemplate(
         "- Do not include semicolons.\n"
         "- Keep queries reasonably bounded (use LIMIT where appropriate).\n"
     ),
-    input_variables=["user_question", "user_discord_id", "schema", "history", "sql_history"],
+    input_variables=[
+        "user_question",
+        "user_discord_id",
+        "schema",
+        "history",
+        "sql_history",
+    ],
     partial_variables={"format_instructions": sql_parser.get_format_instructions()},
 )
 
@@ -270,12 +325,14 @@ async def query_database_tool(
 ) -> Dict[str, Any]:
     """
     Generate SQL using the LLM with retries. On each retry, feed back sql_history + last error so the LLM can improve.
+    If a "no such table" error is detected, immediately triggers a suggestion to use get_all_schema.
     Returns:
         {
           "query": str | None,
           "rows": list | None,
           "error": str | None,
-          "attempts": int
+          "attempts": int,
+          "needs_full_schema": bool  # True if get_all_schema should be called
         }
     """
 
@@ -285,6 +342,7 @@ async def query_database_tool(
 
     last_query = None
     last_error = None
+    no_such_table_found = False
 
     for attempt in range(1, MAX_SQL_RETRIES + 1):
         # Build a readable sql_history string for the prompt
@@ -308,7 +366,7 @@ async def query_database_tool(
         # Ask the model to produce structured JSON that matches SQLQuery
         try:
             response = await model.ainvoke([HumanMessage(content=prompt.to_string())])
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             last_error = f"LLM call failed: {e}"
             sql_history.append({"sql": "", "error": last_error})
             continue
@@ -317,7 +375,7 @@ async def query_database_tool(
         try:
             parsed: SQLQuery = sql_parser.parse(str(response.content))
             last_query = parsed.query.strip()
-        except Exception as e:
+        except ValueError as e:
             last_error = f"Parse error: {e}"
             sql_history.append({"sql": str(response.content), "error": last_error})
             continue
@@ -342,6 +400,7 @@ async def query_database_tool(
                 "rows": [],
                 "error": last_error,
                 "attempts": attempt,
+                "needs_full_schema": False,
             }
 
         # Disallow semicolons (prevent multi-statement)
@@ -364,12 +423,28 @@ async def query_database_tool(
                 "rows": rows,
                 "error": None,
                 "attempts": attempt,
+                "needs_full_schema": False,
             }
-        except Exception as exec_err:
-            last_error = f"Execution error: {exec_err}"
-            sql_history.append({"sql": last_query, "error": last_error})
-            # Continue loop so model can see this execution error in next attempt
-            continue
+        except sqlite3.OperationalError as exec_err:
+            error_str = str(exec_err).lower()
+            # Check if this is a "no such table" error
+            if "no such table" in error_str:
+                no_such_table_found = True
+                last_error = f"Execution error: {exec_err}"
+                sql_history.append({"sql": last_query, "error": last_error})
+                # Immediately signal that full schema is needed instead of retrying
+                return {
+                    "query": last_query,
+                    "rows": [],
+                    "error": last_error,
+                    "attempts": attempt,
+                    "needs_full_schema": True,
+                }
+            else:
+                last_error = f"Execution error: {exec_err}"
+                sql_history.append({"sql": last_query, "error": last_error})
+                # Continue loop so model can see this execution error in next attempt
+                continue
 
     # If we exhausted attempts
     return {
@@ -377,6 +452,7 @@ async def query_database_tool(
         "rows": [],
         "error": last_error or "Failed to produce valid SQL.",
         "attempts": MAX_SQL_RETRIES,
+        "needs_full_schema": no_such_table_found,
     }
 
 
@@ -399,7 +475,7 @@ async def format_discord_message_tool(
     user_question: str,
     sql: Optional[str],
     rows: List[Any],
-    user_discord_id: int,
+    user_discord_id: int,  # noqa: F841
     user_rank: str = "",
     provider: str = "openai",
 ) -> str:
@@ -431,13 +507,13 @@ async def format_discord_message_tool(
 class AIConversationWorkflow:
     def __init__(self, ctx: AIConversationCustomContext):
         self.ctx = ctx
-        
+
         # Create the tools using the factory function
         tools = _create_context_tools(ctx)
-        
+
         # Select the appropriate model
         model = openai_model if ctx.provider == "openai" else google_model
-        
+
         # Create the ReAct agent - it will handle tool calling automatically
         self.agent = create_react_agent(model, tools)
 
@@ -447,24 +523,27 @@ class AIConversationWorkflow:
         Returns the final formatted Discord message.
         """
         ctx = self.ctx
-        
+
         agent_system = SystemMessage(content=system_instruction_when_bot_mentioned)
         agent_human = HumanMessage(
             content=(
                 "You are a Discord assistant. The user asked:\n\n"
                 f"{ctx.user_question}\n\n"
                 "Available tools:\n"
-                "1. get_schema - Retrieve the database schema for the user's question\n"
-                "2. query_database - Generate SQL and execute it against the database\n"
-                "3. format_discord_message - Format the final response for Discord\n\n"
+                "1. get_schema - Retrieve the database schema for the user's question.\n"
+                "2. get_all_schema - Retrieve all the database schema for the user's question. Use immediately if query_database returns 'needs_full_schema: True'.\n"
+                "3. query_database - Generate SQL and execute it against the database.\n"
+                "4. format_discord_message - Format the final response for Discord.\n\n"
                 "Follow this workflow:\n"
-                "1. First, call get_schema to understand what tables are relevant\n"
-                "2. Then, call query_database with the schema to get results\n"
-                "3. Finally, call format_discord_message with the SQL results to produce the final response\n\n"
+                "1. First, call get_schema to understand what tables are relevant.\n"
+                "2. Then, call query_database with the schema to get results.\n"
+                "3. If query_database returns 'needs_full_schema: True', immediately call get_all_schema and retry query_database with the full schema.\n"
+                "4. Finally, call format_discord_message with the SQL results to produce the final response.\n\n"
+                "Critical: If you see 'needs_full_schema: True' in the response, call get_all_schema immediately before retrying.\n"
                 "Do not include internal details like SQL, user id, or database internals in the final output."
             )
         )
-        
+
         # Run the agent - it will automatically:
         # 1. Detect when tools should be called
         # 2. Execute the tools
@@ -472,9 +551,9 @@ class AIConversationWorkflow:
         # 4. Continue until the model produces a final answer
         response = await self.agent.ainvoke(
             {"messages": [agent_system, agent_human]},
-            config={"recursion_limit": MAX_AGENT_STEPS}
+            config={"recursion_limit": MAX_AGENT_STEPS},
         )
-        
+
         # Extract the final message content
         if response and "messages" in response:
             messages = response["messages"]
@@ -484,5 +563,5 @@ class AIConversationWorkflow:
                     return str(last_message.content)
                 else:
                     return str(last_message)
-        
+
         return "Sorry, I couldn't complete your request."
