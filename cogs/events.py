@@ -10,7 +10,7 @@ from discord.ext import commands
 import discord
 from deps.agents.agent_workflow import (
     AIConversationCustomContext,
-    AIConversationWorkflow,
+    run_workflow,
 )
 from deps.bot_singleton import BotSingleton
 from deps.log import print_log, print_error_log
@@ -129,10 +129,8 @@ class MyEventsCog(commands.Cog):
                         user_discord_display_name=message.author.display_name,
                     )
 
-                    workflow = AIConversationWorkflow(ctx)
-
                     # Run the agent workflow
-                    response = await workflow.run()
+                    response = await run_workflow(ctx)
 
                     if response:
                         last_text = response[:3900]

@@ -11,5 +11,25 @@
   "black-formatter.args": [
     "--verbose"
   ],
-  "makefile.configureOnOpen": false
+  "makefile.configureOnOpen": false,
+  "workbench.colorCustomizations": {
+    "activityBar.activeBackground": "#877aaf",
+    "activityBar.background": "#877aaf",
+    "activityBar.foreground": "#15202b",
+    "activityBar.inactiveForeground": "#15202b99",
+    "activityBarBadge.background": "#cfb7af",
+    "activityBarBadge.foreground": "#15202b",
+    "commandCenter.border": "#e7e7e799",
+    "sash.hoverBorder": "#877aaf",
+    "statusBar.background": "#6c5c9a",
+    "statusBar.foreground": "#e7e7e7",
+    "statusBarItem.hoverBackground": "#877aaf",
+    "statusBarItem.remoteBackground": "#6c5c9a",
+    "statusBarItem.remoteForeground": "#e7e7e7",
+    "titleBar.activeBackground": "#6c5c9a",
+    "titleBar.activeForeground": "#e7e7e7",
+    "titleBar.inactiveBackground": "#6c5c9a99",
+    "titleBar.inactiveForeground": "#e7e7e799"
+  },
+  "peacock.remoteColor": "#6c5c9a"
 }

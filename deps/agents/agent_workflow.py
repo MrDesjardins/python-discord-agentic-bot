@@ -1,18 +1,23 @@
-from typing import Any, List, Optional, Dict
+from typing import Any, List, Optional, Dict, TypedDict
 from dataclasses import dataclass, field
 import sqlite3
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
 from langchain.chat_models import init_chat_model
-from langchain.prompts import PromptTemplate
-from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel
+
 
 from deps.database.utils_database import get_table_schema
 from deps.database.system_database import DBName, DatabaseManager
-from deps.rules.system_instructions import system_instruction_when_bot_mentioned
+from deps.rules.system_instructions import (
+    system_instruction_when_bot_mentioned,
+    tool_get_schema_description,
+    tool_get_all_schema_tool_description,
+    tool_sql_query_description,
+    tool_discord_format_message_description,
+)
 
 # ---- Constants ----
 MAX_AGENT_STEPS = 30  # prevent infinite loops
@@ -28,9 +33,6 @@ google_model = init_chat_model("gemini-2.5-flash", model_provider="google_genai"
 class SQLQuery(BaseModel):
     query: str
     explain: Optional[str] = None
-
-
-sql_parser = PydanticOutputParser(pydantic_object=SQLQuery)
 
 
 # ---- Runtime context ----
@@ -88,93 +90,17 @@ def get_activity_schema() -> str:
 def _create_context_tools(ctx: AIConversationCustomContext):
     """Create tool functions with context baked in."""
 
-    @tool("get_schema")
+    @tool("get_schema", description=tool_get_schema_description)
     async def get_schema_tool_wrapped() -> str:
-        """
-        Select and return the relevant database schema(s) based on the content of the user's question.
-
-        🛠 Purpose:
-        - Dynamically determine which database tables are relevant for a given query.
-        - Provide the agent with textual schema information that can be used to generate
-            correct SQL queries.
-        - Ensures the LLM only sees the schema it needs for the current question.
-
-        📥 Input:
-        - user_question: The former question or message from the user that must be answered.
-
-        📤 Output:
-        - A string containing the concatenated schema text for the relevant tables.
-        - Includes user, stats, tournament, and activity tables as needed.
-
-        🧠 When to use:
-        - Call this tool **before generating SQL queries**.
-        - The agent should use this tool when the user question involves:
-            • Player statistics, matches, or general data queries → include stats schema
-            • Tournaments, bets, or team info → include tournament schema
-            • Timing, schedule, or activity tracking → include activity schema
-        - Use this tool whenever the LLM needs structured table information
-            to generate valid queries.
-
-        🚫 Notes:
-        - Only the user_question is needed; other context like user_id or rank is not required.
-        - Returns plain text; the LLM should not attempt to interpret or modify the schema.
-        """
         return await get_schema_tool(user_question=ctx.user_question)
 
-    @tool("get_all_schema")
+    @tool("get_all_schema", description=tool_get_all_schema_tool_description)
     async def get_all_schema_tool_wrapped() -> str:
-        """
-        Select and return all the database schemas
-
-        🛠 Purpose:
-        - Ensures the LLM sees all the schema in case the situational tool did not work out.
-
-        📥 Input:
-        - None
-
-        📤 Output:
-        - A string containing the concatenated schema text for the relevant tables.
-        - Includes user, stats, tournament, and activity tables as needed.
-
-        🧠 When to use:
-        - Call this tool **before generating SQL queries** only when the get_schema did not provide sufficient information.
-        - Use this tool whenever the LLM needs structured table information
-            to generate valid queries.
-
-        🚫 Notes:
-        - Returns plain text; the LLM should not attempt to interpret or modify the schema.
-        """
         return await get_all_schema_tool()
 
-    @tool("query_sql_query_database")
+    @tool("query_sql_query_database", description=tool_sql_query_description)
     async def query_database_tool_wrapped(schema: str) -> Dict[str, Any]:
-        """
-        Generate and execute a SQL query based on the user's question and the provided database schema.
 
-        🛠 Purpose:
-        - Create a SELECT query that accurately retrieves data relevant to the user's request.
-        - Execute the generated SQL against the SIEGE database and return the results.
-        - Handle retries and errors in SQL generation and execution.
-
-        📥 Required arguments (must be provided by the agent):
-        - schema: The database schema text relevant to the user's question.
-
-        📤 Output:
-        - A dictionary containing:
-            • "query": The generated SQL query string (or None if failed).
-            • "rows": The list of result rows returned from the database (or empty list).
-            • "error": Any error message encountered during generation/execution (or None).
-            • "attempts": The number of attempts taken to generate/execute valid SQL.
-
-        🧠 When to use:
-        - Call this tool after obtaining the relevant schema using the get_schema tool.
-        - Use this tool when the user question requires data retrieval from the database.
-        - The agent should invoke this tool whenever it needs to fetch data to answer the user's query
-
-        🚫 Notes:
-        - The tool automatically handles user context (question, ID, history); do not pass these manually.
-        - Only read-only SELECT queries are allowed; destructive operations are blocked.
-        """
         return await query_database_tool(
             user_question=ctx.user_question,
             user_discord_id=ctx.user_discord_id,
@@ -185,38 +111,13 @@ def _create_context_tools(ctx: AIConversationCustomContext):
             schema=schema,
         )
 
-    @tool("format_message_for_discord")
+    @tool(
+        "format_message_for_discord",
+        description=tool_discord_format_message_description,
+    )
     async def format_discord_message_tool_wrapped(
         sql: Optional[str], rows: List[Any]
     ) -> str:
-        """
-        Use this tool ONLY to generate the final textual response that will be sent back to the Discord user.
-
-        🛠 Purpose:
-        - Format a complete and human-readable reply from the bot.
-        - Combine the user's original question, relevant Discord message history, executed SQL (if any),
-            and the retrieved query result rows.
-        - Optionally adjust tone based on the user's rank (e.g., "Champion").
-
-        📥 Required arguments (must be provided by the agent):
-        - discord_message_history: Recent messages from the current Discord conversation.
-        - user_question: The user's most recent message or query.
-        - sql: The SQL statement used to fetch data (if any) or an empty string.
-        - rows: The result returned from the database query.
-
-        🚫 DO NOT provide the following arguments in tool calls (they are injected automatically):
-        - user_discord_id
-        - provider
-        - user_rank
-
-        📤 Output:
-        - A final, properly formatted text response for Discord.
-        - Must NOT include markdown code fences or system-like formatting—return plain text only.
-
-        🔁 When to call:
-        - After database query results are successfully retrieved.
-        - As the final step before returning the final answer to the user.
-        """
         return await format_discord_message_tool(
             sql=sql,
             rows=rows,
@@ -291,28 +192,18 @@ async def get_all_schema_tool() -> str:
 
 
 # Prompt template for SQL generation; format_instructions will be injected
-SQL_PROMPT = PromptTemplate(
-    template=(
-        "You are an expert SQL assistant for SQLite 3.\n"
-        "When appropriate, use the exact user_id: {user_discord_id}.\n"
-        "Database schema provided:\n{schema}\n\n"
-        "Past conversation / history:\n{history}\n\n"
-        "Previous SQL attempts and errors (if any):\n{sql_history}\n\n"
-        "User question: {user_question}\n\n"
-        "Return ONLY a JSON object that matches this pydantic schema:\n{format_instructions}\n\n"
-        "Important safety notes:\n"
-        "- Only produce read-only SQL (SELECT / WITH). Do NOT produce INSERT/UPDATE/DELETE/ALTER/DROP/ATTACH/DETACH.\n"
-        "- Do not include semicolons.\n"
-        "- Keep queries reasonably bounded (use LIMIT where appropriate).\n"
-    ),
-    input_variables=[
-        "user_question",
-        "user_discord_id",
-        "schema",
-        "history",
-        "sql_history",
-    ],
-    partial_variables={"format_instructions": sql_parser.get_format_instructions()},
+SQL_PROMPT_TEMPLATE = (
+    "You are an expert SQL assistant for SQLite 3.\n"
+    "When appropriate, use the exact user_id: {user_discord_id}.\n"
+    "Database schema provided:\n{schema}\n\n"
+    "Past conversation / history:\n{history}\n\n"
+    "Previous SQL attempts and errors (if any):\n{sql_history}\n\n"
+    "User question: {user_question}\n\n"
+    "Return ONLY a JSON object that matches this pydantic schema:\n{format_instructions}\n\n"
+    "Important safety notes:\n"
+    "- Only produce read-only SQL (SELECT / WITH). Do NOT produce INSERT/UPDATE/DELETE/ALTER/DROP/ATTACH/DETACH.\n"
+    "- Do not include semicolons.\n"
+    "- Keep queries reasonably bounded (use LIMIT where appropriate).\n"
 )
 
 
@@ -355,27 +246,28 @@ async def query_database_tool(
                 parts.append(f"Attempt {i+1}:\nQuery:\n{q}\nError:\n{e}\n")
             sql_history_text = "\n".join(parts)
 
-        prompt = SQL_PROMPT.format_prompt(
+        prompt_str = SQL_PROMPT_TEMPLATE.format(
             user_question=user_question,
             user_discord_id=user_discord_id,
             schema=schema,
             history=discord_message_history,
             sql_history=sql_history_text,
+            format_instructions=SQLQuery.model_json_schema(),
         )
 
         # Ask the model to produce structured JSON that matches SQLQuery
         try:
-            response = await model.ainvoke([HumanMessage(content=prompt.to_string())])
+            response = await model.ainvoke([HumanMessage(content=prompt_str)])
         except (ValueError, RuntimeError) as e:
             last_error = f"LLM call failed: {e}"
             sql_history.append({"sql": "", "error": last_error})
             continue
 
-        # Parse the structured JSON returned by the model
+        # Parse the structured JSON returned by the model (pydantic v2)
         try:
-            parsed: SQLQuery = sql_parser.parse(str(response.content))
+            parsed: SQLQuery = SQLQuery.model_validate_json(response.content)
             last_query = parsed.query.strip()
-        except ValueError as e:
+        except Exception as e:
             last_error = f"Parse error: {e}"
             sql_history.append({"sql": str(response.content), "error": last_error})
             continue
@@ -457,16 +349,13 @@ async def query_database_tool(
 
 
 # Format prompt for final message generation
-FORMAT_PROMPT = PromptTemplate(
-    template=(
-        "You are a friendly assistant formatting a Discord message. Do NOT mention SQL, DB internals, user ids, or internal IDs.\n"
-        "Channel history:\n{history}\n\n"
-        "User question:\n{question}\n\n"
-        "SQL used (for reference only):\n{sql}\n\n"
-        "Database rows (for reference only):\n{rows}\n\n"
-        "Produce a concise Markdown reply suitable for Discord. If there is tabular data, use triple-backtick blocks for tables.\n"
-    ),
-    input_variables=["history", "question", "sql", "rows"],
+FORMAT_PROMPT_TEMPLATE = (
+    "You are a friendly assistant formatting a Discord message. Do NOT mention SQL, DB internals, user ids, or internal IDs.\n"
+    "Channel history:\n{history}\n\n"
+    "User question:\n{question}\n\n"
+    "SQL used (for reference only):\n{sql}\n\n"
+    "Database rows (for reference only):\n{rows}\n\n"
+    "Produce a concise Markdown reply suitable for Discord. If there is tabular data, use triple-backtick blocks for tables.\n"
 )
 
 
@@ -490,7 +379,7 @@ async def format_discord_message_tool(
         # Keep it friendly but slightly different if you want
         system_text += " Address the user as 'champion' and keep a light witty tone."
 
-    prompt = FORMAT_PROMPT.format_prompt(
+    prompt_str = FORMAT_PROMPT_TEMPLATE.format(
         history=discord_message_history or "",
         question=user_question,
         sql=sql or "",
@@ -498,70 +387,120 @@ async def format_discord_message_tool(
     )
 
     final_output = await model.ainvoke(
-        [SystemMessage(content=system_text), HumanMessage(content=prompt.to_string())]
+        [SystemMessage(content=system_text), HumanMessage(content=prompt_str)]
     )
     # Ensure we return a string
     return str(final_output.content)
 
+# --- Define the graph state ---
+class WorkflowState(TypedDict, total=False):
+    # Contextual inputs
+    user_question: str
+    user_discord_id: int
+    user_rank: str
+    history: str          # recent message history
+    provider: str
 
-class AIConversationWorkflow:
-    def __init__(self, ctx: AIConversationCustomContext):
-        self.ctx = ctx
+    # Intermediate / result fields
+    schema: Optional[str]
+    query: Optional[str]
+    rows: Optional[List[Any]]
+    formatted_message: Optional[str]
+    needs_retry: Optional[bool]
 
-        # Create the tools using the factory function
-        tools = _create_context_tools(ctx)
+# --- Node definitions ---
 
-        # Select the appropriate model
-        model = openai_model if ctx.provider == "openai" else google_model
+def interpret_question_node(state: WorkflowState) -> Dict[str, Any]:
+    """
+    Decide whether a DB query is needed. If not, we can skip DB and return a default message.
+    """
+    question = state["user_question"]
+    llm: BaseChatModel = openai_model if state.get("provider", "openai") == "openai" else google_model
+    resp = llm.invoke(
+        [HumanMessage(content=f"User asked: {question}\nDo you need to query the database to answer? Answer yes or no.")]
+    )
+    needs = "yes" in resp.content.lower()
+    return {"needs_retry": False, "schema": None, "_skip_db": not needs}
 
-        # Create the ReAct agent - it will handle tool calling automatically
-        self.agent = create_react_agent(model, tools)
+async def get_schema_node(state: WorkflowState) -> Dict[str, Any]:
+    schema = await get_schema_tool(state["user_question"])
+    return {"schema": schema}
 
-    async def run(self) -> str:
-        """
-        Run the agent workflow for the user question.
-        Returns the final formatted Discord message.
-        """
-        ctx = self.ctx
+async def sql_query_node(state: WorkflowState) -> Dict[str, Any]:
+    result = await query_database_tool(
+        user_question=state["user_question"],
+        user_discord_id=state["user_discord_id"],
+        schema=state["schema"],
+        discord_message_history=state["history"],
+        provider=state["provider"],
+    )
+    # result: dict with keys "query", "rows", "error", "attempts", "needs_full_schema"
+    return {"query": result.get("query"), "rows": result.get("rows", [])}
 
-        agent_system = SystemMessage(content=system_instruction_when_bot_mentioned)
-        agent_human = HumanMessage(
-            content=(
-                "You are a Discord assistant. The user asked:\n\n"
-                f"{ctx.user_question}\n\n"
-                "Available tools:\n"
-                "1. get_schema - Retrieve the database schema for the user's question.\n"
-                "2. get_all_schema - Retrieve all the database schema for the user's question. Use immediately if query_database returns 'needs_full_schema: True'.\n"
-                "3. query_database - Generate SQL and execute it against the database.\n"
-                "4. format_discord_message - Format the final response for Discord.\n\n"
-                "Follow this workflow:\n"
-                "1. First, call get_schema to understand what tables are relevant.\n"
-                "2. Then, call query_database with the schema to get results.\n"
-                "3. If query_database returns 'needs_full_schema: True', immediately call get_all_schema and retry query_database with the full schema.\n"
-                "4. Finally, call format_discord_message with the SQL results to produce the final response.\n\n"
-                "Critical: If you see 'needs_full_schema: True' in the response, call get_all_schema immediately before retrying.\n"
-                "Do not include internal details like SQL, user id, or database internals in the final output."
-            )
-        )
+async def format_output_node(state: WorkflowState) -> Dict[str, Any]:
+    formatted = await format_discord_message_tool(
+        sql=state.get("query"),
+        rows=state.get("rows", []),
+        discord_message_history=state["history"],
+        user_question=state["user_question"],
+        user_discord_id=state["user_discord_id"],
+        user_rank=state["user_rank"],
+        provider=state["provider"],
+    )
+    return {"formatted_message": formatted}
 
-        # Run the agent - it will automatically:
-        # 1. Detect when tools should be called
-        # 2. Execute the tools
-        # 3. Pass results back to the model
-        # 4. Continue until the model produces a final answer
-        response = await self.agent.ainvoke(
-            {"messages": [agent_system, agent_human]},
-            config={"recursion_limit": MAX_AGENT_STEPS},
-        )
+def evaluate_node(state: WorkflowState) -> Dict[str, Any]:
+    question = state["user_question"]
+    formatted = state.get("formatted_message", "")
+    llm: BaseChatModel = openai_model if state.get("provider", "openai") == "openai" else google_model
+    resp = llm.invoke(
+        [HumanMessage(content=f"User asked: {question}\nResult:\n{formatted}\nDoes this answer the question? yes or no.")]
+    )
+    needs = not ("yes" in resp.content.lower())
+    return {"needs_retry": needs}
 
-        # Extract the final message content
-        if response and "messages" in response:
-            messages = response["messages"]
-            if messages:
-                last_message = messages[-1]
-                if isinstance(last_message, AIMessage):
-                    return str(last_message.content)
-                else:
-                    return str(last_message)
+# --- Build the graph ---
+builder = StateGraph(WorkflowState)
 
-        return "Sorry, I couldn't complete your request."
+builder.add_node("interpret_question", interpret_question_node)
+builder.add_node("get_schema", get_schema_node)
+builder.add_node("sql_query", sql_query_node)
+builder.add_node("format_output", format_output_node)
+builder.add_node("evaluate", evaluate_node)
+
+# Entry edge
+builder.add_edge(START, "interpret_question")
+
+# After interpret: either skip DB → directly format output (e.g. say "No DB needed") OR go to get_schema
+def route_after_interpret(state: WorkflowState) -> str:
+    return "sql_query" if not state.get("_skip_db", False) else "format_output"
+
+builder.add_conditional_edges("interpret_question", route_after_interpret)
+
+# Schema → SQL query
+builder.add_edge("get_schema", "sql_query")
+
+# SQL query → Format output
+builder.add_edge("sql_query", "format_output")
+
+# Format output → Evaluate
+builder.add_edge("format_output", "evaluate")
+
+# Evaluate → either SQL retry OR END
+def route_after_eval(state: WorkflowState) -> str:
+    return "sql_query" if state.get("needs_retry", False) else END
+
+builder.add_conditional_edges("evaluate", route_after_eval)
+
+graph = builder.compile()
+
+async def run_workflow(ctx: AIConversationCustomContext) -> str:
+    initial: WorkflowState = {
+        "user_question": ctx.user_question,
+        "user_discord_id": ctx.user_discord_id,
+        "user_rank": ctx.user_rank,
+        "history": "\n".join(ctx.message_history[-MAX_HISTORY_MESSAGES:]),
+        "provider": ctx.provider,
+    }
+    final_state = await graph.ainvoke(initial)
+    return final_state.get("formatted_message", "Sorry — I could not answer your question.")
