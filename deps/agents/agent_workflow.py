@@ -1,14 +1,14 @@
 from typing import Any, List, Optional, Dict, TypedDict
 from dataclasses import dataclass, field
 import sqlite3
-from langchain_core.tools import tool
+import contextvars
 from langchain.chat_models import init_chat_model
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.language_models import BaseChatModel
-
-
+from langchain.tools import tool, ToolRuntime
+from langgraph.types import Command
 from deps.database.utils_database import get_table_schema
 from deps.database.system_database import DBName, DatabaseManager
 from deps.rules.system_instructions import (
@@ -44,6 +44,19 @@ class AIConversationCustomContext:
     user_discord_id: int = 0
     user_discord_display_name: str = ""
     user_rank: str = ""
+
+# ---- Thread-local context storage for tools ----
+_current_context: contextvars.ContextVar[Optional[AIConversationCustomContext]] = contextvars.ContextVar(
+    'current_context', default=None
+)
+
+
+# --- Define the graph state ---
+class WorkflowState(TypedDict, total=False):
+    raw_message: Optional[str]
+    formatted_message: Optional[str]
+    needs_retry: Optional[bool]
+    skip_db: Optional[bool]
 
 
 # ---- Database helpers ----
@@ -86,64 +99,14 @@ def get_activity_schema() -> str:
     return f"{get_table_schema('user_activity')}\nThe field `event` in the table `user_activity` can be `connect` or `disconnect`.\n"
 
 
-# Create wrapped tool functions outside the class for proper LangGraph integration
-def _create_context_tools(ctx: AIConversationCustomContext):
-    """Create tool functions with context baked in."""
-
-    @tool("get_schema", description=tool_get_schema_description)
-    async def get_schema_tool_wrapped() -> str:
-        return await get_schema_tool(user_question=ctx.user_question)
-
-    @tool("get_all_schema", description=tool_get_all_schema_tool_description)
-    async def get_all_schema_tool_wrapped() -> str:
-        return await get_all_schema_tool()
-
-    @tool("query_sql_query_database", description=tool_sql_query_description)
-    async def query_database_tool_wrapped(schema: str) -> Dict[str, Any]:
-
-        return await query_database_tool(
-            user_question=ctx.user_question,
-            user_discord_id=ctx.user_discord_id,
-            discord_message_history="\n".join(
-                ctx.message_history[:MAX_HISTORY_MESSAGES]
-            ),
-            provider=ctx.provider,
-            schema=schema,
-        )
-
-    @tool(
-        "format_message_for_discord",
-        description=tool_discord_format_message_description,
-    )
-    async def format_discord_message_tool_wrapped(
-        sql: Optional[str], rows: List[Any]
-    ) -> str:
-        return await format_discord_message_tool(
-            sql=sql,
-            rows=rows,
-            user_discord_id=ctx.user_discord_id,
-            user_rank=ctx.user_rank,
-            discord_message_history="\n".join(
-                ctx.message_history[:MAX_HISTORY_MESSAGES]
-            ),
-            user_question=ctx.user_question,
-            provider=ctx.provider,
-        )
-
-    return [
-        get_schema_tool_wrapped,
-        get_all_schema_tool_wrapped,
-        query_database_tool_wrapped,
-        format_discord_message_tool_wrapped,
-    ]
-
-
-class ContextTools:
-    def __init__(self, ctx: AIConversationCustomContext):
-        self.ctx = ctx
-
-
-async def get_schema_tool(user_question: str) -> str:
+@tool("get_schema", description=tool_get_schema_description)
+async def get_schema_tool() -> str:
+    """Get relevant database schema based on the user question."""
+    ctx = _current_context.get()
+    if not ctx:
+        return "Error: No context available"
+    
+    user_question = ctx.user_question
     name = (user_question or "").lower()
     schema = get_user_schema()
     if any(
@@ -182,7 +145,8 @@ async def get_schema_tool(user_question: str) -> str:
     return schema
 
 
-async def get_all_schema_tool() -> str:
+@tool("get_all_schema", description=tool_get_all_schema_tool_description)
+async def get_all_schema() -> str:
     return (
         f"{get_user_schema()}\n"
         f"{get_stats_schema()}\n"
@@ -207,13 +171,8 @@ SQL_PROMPT_TEMPLATE = (
 )
 
 
-async def query_database_tool(
-    user_question: str,
-    user_discord_id: int,
-    schema: str,
-    discord_message_history: str = "",
-    provider: str = "openai",
-) -> Dict[str, Any]:
+@tool("query_database_tool", description=tool_sql_query_description)
+async def query_database_tool(schema: str) -> Dict[str, Any]:
     """
     Generate SQL using the LLM with retries. On each retry, feed back sql_history + last error so the LLM can improve.
     If a "no such table" error is detected, immediately triggers a suggestion to use get_all_schema.
@@ -226,7 +185,14 @@ async def query_database_tool(
           "needs_full_schema": bool  # True if get_all_schema should be called
         }
     """
-
+    ctx = _current_context.get()
+    if not ctx:
+        return {"query": None, "rows": [], "error": "No context available", "attempts": 0, "needs_full_schema": False}
+    
+    user_question = ctx.user_question
+    user_discord_id = ctx.user_discord_id
+    discord_message_history = "\n".join(ctx.message_history[:MAX_HISTORY_MESSAGES])
+    provider = ctx.provider
     model: BaseChatModel = openai_model if provider == "openai" else google_model
 
     sql_history: List[Dict[str, str]] = []
@@ -359,18 +325,19 @@ FORMAT_PROMPT_TEMPLATE = (
 )
 
 
-async def format_discord_message_tool(
-    discord_message_history: str,
-    user_question: str,
+async def format_message_for_discord(
     sql: Optional[str],
     rows: List[Any],
-    user_discord_id: int,  # noqa: F841
-    user_rank: str = "",
-    provider: str = "openai",
+    runtime: ToolRuntime[AIConversationCustomContext],
 ) -> str:
     """
     Formats a final message for Discord. Calls the LLM to produce the textual reply.
     """
+    ctx = runtime.context
+    provider = ctx.provider
+    user_question = ctx.user_question
+    user_rank = ctx.user_rank
+    discord_message_history = "\n".join(ctx.message_history[:MAX_HISTORY_MESSAGES])
     model = openai_model if provider == "openai" else google_model
 
     # Slight tone modification for rank
@@ -392,115 +359,154 @@ async def format_discord_message_tool(
     # Ensure we return a string
     return str(final_output.content)
 
-# --- Define the graph state ---
-class WorkflowState(TypedDict, total=False):
-    # Contextual inputs
-    user_question: str
-    user_discord_id: int
-    user_rank: str
-    history: str          # recent message history
-    provider: str
-
-    # Intermediate / result fields
-    schema: Optional[str]
-    query: Optional[str]
-    rows: Optional[List[Any]]
-    formatted_message: Optional[str]
-    needs_retry: Optional[bool]
 
 # --- Node definitions ---
-
-def interpret_question_node(state: WorkflowState) -> Dict[str, Any]:
+def interpret_question_node(
+    state: WorkflowState, runtime: ToolRuntime[AIConversationCustomContext]
+) -> Dict[str, Any]:
     """
     Decide whether a DB query is needed. If not, we can skip DB and return a default message.
     """
-    question = state["user_question"]
-    llm: BaseChatModel = openai_model if state.get("provider", "openai") == "openai" else google_model
+    question = runtime.context.user_question
+    llm: BaseChatModel = (
+        openai_model if runtime.context.provider == "openai" else google_model
+    )
     resp = llm.invoke(
-        [HumanMessage(content=f"User asked: {question}\nDo you need to query the database to answer? Answer yes or no.")]
+        [
+            HumanMessage(
+                content=f"User asked: {question}\nDo you need to query thre system private database to answer or you can answer with your general knowledge? Answer yes to access the database or no to directly answer."
+            )
+        ]
     )
     needs = "yes" in resp.content.lower()
-    return {"needs_retry": False, "schema": None, "_skip_db": not needs}
+    return {"needs_retry": False, "schema": None, "skip_db": not needs}
 
-async def get_schema_node(state: WorkflowState) -> Dict[str, Any]:
-    schema = await get_schema_tool(state["user_question"])
-    return {"schema": schema}
 
-async def sql_query_node(state: WorkflowState) -> Dict[str, Any]:
-    result = await query_database_tool(
-        user_question=state["user_question"],
-        user_discord_id=state["user_discord_id"],
-        schema=state["schema"],
-        discord_message_history=state["history"],
-        provider=state["provider"],
+async def get_access_database_knowledge_node(
+    state: WorkflowState, runtime: ToolRuntime[AIConversationCustomContext]
+) -> Dict[str, Any]:
+    question = runtime.context.user_question
+    llm: BaseChatModel = (
+        openai_model if runtime.context.provider == "openai" else google_model
     )
-    # result: dict with keys "query", "rows", "error", "attempts", "needs_full_schema"
-    return {"query": result.get("query"), "rows": result.get("rows", [])}
+    
+    # Set the context for tools to access
+    _current_context.set(runtime.context)
+    
+    try:
+        # Bind the tools to the LLM
+        tools = [get_schema_tool, get_all_schema, query_database_tool]
+        llm_with_tools = llm.bind_tools(tools)
+        
+        # Create a mapping of tool names to tool objects for execution
+        tool_map = {tool.name: tool for tool in tools}
+        
+        # Agentic loop: keep invoking until we get a final response (not a tool call)
+        messages = [
+            HumanMessage(
+                content=f"User asked: {question}\nUse the tools to get the database schema and query to get the data you need to answer the question."
+            )
+        ]
+        
+        for _ in range(MAX_AGENT_STEPS):
+            resp = await llm_with_tools.ainvoke(messages)
+            messages.append(resp)
+            
+            # Check if the response contains tool calls
+            if not hasattr(resp, "tool_calls") or not resp.tool_calls:
+                # No more tool calls, return final response
+                return Command(update={"raw_message": resp.content})
+            
+            # Process tool calls
+            for tool_call in resp.tool_calls:
+                tool_name = tool_call["name"]
+                tool_input = tool_call.get("args", {})
+                
+                # Execute the tool using ainvoke
+                if tool_name in tool_map:
+                    tool_obj = tool_map[tool_name]
+                    result = await tool_obj.ainvoke(tool_input)
+                else:
+                    result = f"Unknown tool: {tool_name}"
+                
+                # Add tool result to messages
+                messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
+        
+        # If we exhausted steps, return what we have
+        return Command(update={"raw_message": resp.content})
+    finally:
+        # Clear the context when done
+        _current_context.set(None)
 
-async def format_output_node(state: WorkflowState) -> Dict[str, Any]:
-    formatted = await format_discord_message_tool(
-        sql=state.get("query"),
-        rows=state.get("rows", []),
-        discord_message_history=state["history"],
-        user_question=state["user_question"],
-        user_discord_id=state["user_discord_id"],
-        user_rank=state["user_rank"],
-        provider=state["provider"],
+
+async def format_output_node(
+    state: WorkflowState, runtime: ToolRuntime[AIConversationCustomContext]
+) -> Dict[str, Any]:
+    formatted = await format_message_for_discord(
+        sql=state.get("query"), rows=state.get("rows", []), runtime=runtime
     )
-    return {"formatted_message": formatted}
+    return Command(update={"formatted_message": formatted})
 
-def evaluate_node(state: WorkflowState) -> Dict[str, Any]:
-    question = state["user_question"]
+
+def evaluate_node(
+    state: WorkflowState, runtime: ToolRuntime[AIConversationCustomContext]
+) -> Dict[str, Any]:
+    question = runtime.context.user_question
     formatted = state.get("formatted_message", "")
-    llm: BaseChatModel = openai_model if state.get("provider", "openai") == "openai" else google_model
+    llm: BaseChatModel = (
+        openai_model if runtime.context.provider == "openai" else google_model
+    )
     resp = llm.invoke(
-        [HumanMessage(content=f"User asked: {question}\nResult:\n{formatted}\nDoes this answer the question? yes or no.")]
+        [
+            HumanMessage(
+                content=f"User asked: {question}\nResult:\n{formatted}\nDoes this answer the question? Answer only with 'yes' or 'no'."
+            )
+        ]
     )
     needs = not ("yes" in resp.content.lower())
-    return {"needs_retry": needs}
+    return Command(update={"needs_retry": needs})
+
 
 # --- Build the graph ---
-builder = StateGraph(WorkflowState)
+builder = StateGraph(WorkflowState, AIConversationCustomContext)
 
 builder.add_node("interpret_question", interpret_question_node)
-builder.add_node("get_schema", get_schema_node)
-builder.add_node("sql_query", sql_query_node)
+builder.add_node(
+    "get_access_database_knowledge_node", get_access_database_knowledge_node
+)
 builder.add_node("format_output", format_output_node)
 builder.add_node("evaluate", evaluate_node)
 
 # Entry edge
 builder.add_edge(START, "interpret_question")
 
-# After interpret: either skip DB → directly format output (e.g. say "No DB needed") OR go to get_schema
+
 def route_after_interpret(state: WorkflowState) -> str:
-    return "sql_query" if not state.get("_skip_db", False) else "format_output"
+    return (
+        "get_access_database_knowledge_node"
+        if not state.get("skip_db", False)
+        else "format_output"
+    )
+
 
 builder.add_conditional_edges("interpret_question", route_after_interpret)
-
-# Schema → SQL query
-builder.add_edge("get_schema", "sql_query")
-
-# SQL query → Format output
-builder.add_edge("sql_query", "format_output")
-
-# Format output → Evaluate
+builder.add_edge("get_access_database_knowledge_node", "format_output")
 builder.add_edge("format_output", "evaluate")
 
-# Evaluate → either SQL retry OR END
+
 def route_after_eval(state: WorkflowState) -> str:
-    return "sql_query" if state.get("needs_retry", False) else END
+    return (
+        "get_access_database_knowledge_node" if state.get("needs_retry", False) else END
+    )
+
 
 builder.add_conditional_edges("evaluate", route_after_eval)
 
 graph = builder.compile()
 
+
 async def run_workflow(ctx: AIConversationCustomContext) -> str:
-    initial: WorkflowState = {
-        "user_question": ctx.user_question,
-        "user_discord_id": ctx.user_discord_id,
-        "user_rank": ctx.user_rank,
-        "history": "\n".join(ctx.message_history[-MAX_HISTORY_MESSAGES:]),
-        "provider": ctx.provider,
-    }
-    final_state = await graph.ainvoke(initial)
-    return final_state.get("formatted_message", "Sorry — I could not answer your question.")
+    final_state = await graph.ainvoke({}, context=ctx)
+    return final_state.get(
+        "formatted_message", "Sorry — I could not answer your question."
+    )
